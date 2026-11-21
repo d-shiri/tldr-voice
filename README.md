@@ -45,10 +45,7 @@ Pick **English** or **German** when asked, then restart Claude Code. On first st
 > sudo apt install mpv
 > ```
 
-<details open>
-<summary><b>Claude Code older than 2.1.275?</b> Install in two steps</summary>
-
-<br>
+**Claude Code older than 2.1.275?** Install in two steps:
 
 ```bash
 # 1. Add the marketplace
@@ -58,20 +55,13 @@ Pick **English** or **German** when asked, then restart Claude Code. On first st
 /plugin install tldr-voice@tldr-voice
 ```
 
-</details>
-
-<details open>
-<summary><b>Let Claude do it:</b> paste this prompt into Claude Code</summary>
-
-<br>
+**Let Claude do it:** paste this prompt into Claude Code:
 
 ```markdown
 Install the tldr-voice plugin for me: run `claude plugin marketplace add d-shiri/tldr-voice`
 and `claude plugin install tldr-voice@tldr-voice`, make sure python3 and mpv are installed
 (install mpv if missing), then tell me to restart Claude Code.
 ```
-
-</details>
 
 ## Use
 
