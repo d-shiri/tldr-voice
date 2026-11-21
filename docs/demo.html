@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-<meta name="description" content="tldr-voice: Claude Code reads the one-line summary of every answer aloud.">
+<meta name="description" content="How tldr-voice works: Claude Code reads the one-line summary of every answer aloud.">
 <title>TL;DR Voice</title>
 <meta name="claude:viewport-fit-sides" content="cover">
 <link rel="preconnect" href="https://fonts.googleapis.com">
@@ -67,56 +67,35 @@
   .scene.on .up { animation: up .7s cubic-bezier(.2,.8,.2,1) both; animation-delay: var(--t, 0s); }
   @keyframes up { from { opacity: 0; transform: translateY(2.2cqw); } to { opacity: 1; transform: none; } }
 
-  /* scene 1: the wall of text */
-  .wall { position: absolute; inset: 0; padding: 3cqw 5.5cqw; overflow: hidden; opacity: .55;
-          mask-image: linear-gradient(transparent, #000 25%, #000 75%, transparent); }
-  .wall-in { display: grid; gap: 1.15cqw; }
-  .scene.on .wall-in { animation: scroll 4.6s linear both; }
-  @keyframes scroll { from { transform: translateY(0); } to { transform: translateY(-55%); } }
-  .wl { height: 1.15cqw; border-radius: .6cqw; background: var(--line); }
-  .wl.t { background: #4b4060; }
-  .s1 .copy { position: relative; z-index: 2; }
-  .s1 .big { text-shadow: 0 .4cqw 3cqw var(--screen); }
-
-  /* scene 2: the TL;DR line */
+  /* terminal lines */
   .term { font-family: var(--mono); font-size: 2.3cqw; line-height: 1.6; color: var(--dim); }
   .prompt { color: var(--cyan); }
+  .typed { display: inline-block; white-space: nowrap; overflow: hidden; vertical-align: bottom; max-width: 100%; }
+  .scene.on .typed { animation: type var(--dur, 1.4s) steps(var(--n, 34), end) var(--t, .4s) both; }
+  @keyframes type { from { width: 0; } to { width: calc(var(--n, 34) * 1ch); } }
   .tldr {
-    display: inline-block; color: var(--ink); background: var(--peach); padding: .3cqw 1.2cqw; border-radius: .6cqw;
-    font-weight: 500; white-space: nowrap; overflow: hidden; max-width: 100%;
+    color: var(--ink); background: var(--peach); padding: .3cqw 1.2cqw; border-radius: .6cqw; font-weight: 500;
   }
-  .scene.on .tldr { animation: type 1.6s steps(48, end) .5s both; }
-  @keyframes type { from { width: 0; } to { width: 50ch; } }
   .ghost { display: grid; gap: 1cqw; margin-top: 1.4cqw; }
-  .ghost .wl { opacity: .5; }
+  .wl { height: 1.15cqw; border-radius: .6cqw; background: var(--line); opacity: .7; }
+  .scene.on .ghost .wl { animation: up .4s ease both; animation-delay: var(--t); }
 
-  /* scene 3: the voice */
-  .wave { display: flex; align-items: center; gap: .55cqw; height: 13cqw; }
-  .wave b { flex: 1; height: 100%; background: var(--cyan); border-radius: .5cqw; transform: scaleY(.08); opacity: .9; }
-  .scene.on .wave b { animation: talk var(--d) ease-in-out var(--o) infinite alternate; }
-  @keyframes talk { from { transform: scaleY(.08); } to { transform: scaleY(var(--h)); } }
-  .printing { font-family: var(--mono); font-size: 1.8cqw; color: var(--dim); display: grid; gap: .8cqw; }
-  .scene.on .printing div { animation: up .4s ease both; animation-delay: var(--t); }
-
-  /* scene 4: the numbers */
-  .stats { display: grid; grid-template-columns: repeat(4, 1fr); gap: 1.8cqw; }
-  .stat { border-top: .3cqw solid var(--peach); padding-top: 1.4cqw; display: grid; gap: .6cqw; align-content: start; }
-  .stat:nth-child(even) { border-color: var(--cyan); }
-  .stat .n { font-weight: 800; font-size: 6.2cqw; line-height: 1; font-variant-numeric: tabular-nums; letter-spacing: -.02em; }
-  .stat .l { font-size: 1.85cqw; line-height: 1.3; color: var(--paper); opacity: .85; }
-
-  /* scene 5: the commands */
-  .cmds { font-family: var(--mono); font-size: 2.6cqw; display: grid; gap: 1.3cqw; }
-  .cmds div { display: flex; gap: 2cqw; align-items: baseline; flex-wrap: wrap; }
+  /* steps and lists */
+  .step { font-family: var(--mono); font-size: 1.7cqw; color: var(--peach); letter-spacing: .08em; text-transform: uppercase; margin: 0; }
+  .rows { display: grid; gap: 1.6cqw; }
+  .row { display: flex; gap: 2cqw; align-items: baseline; flex-wrap: wrap; font-size: 3cqw; font-weight: 700; }
+  .row .arrow { color: var(--dim); font-weight: 400; }
+  kbd { font-family: var(--mono); font-size: 2.2cqw; font-weight: 500; color: var(--paper); border: .2cqw solid var(--dim);
+        border-bottom-width: .5cqw; border-radius: .7cqw; padding: .2cqw 1.6cqw; }
+  .cmds { font-family: var(--mono); font-size: 2.5cqw; display: grid; gap: 1.2cqw; }
+  .cmds div { display: grid; grid-template-columns: 31ch 1fr; gap: 2cqw; align-items: baseline; }
   .cmds code { color: var(--paper); }
-  .cmds em { font-style: normal; color: var(--dim); font-size: 1.9cqw; font-family: var(--display); }
+  .cmds em { font-style: normal; color: var(--dim); font-size: 2.1cqw; font-family: var(--display); }
 
-  /* scene 6: end card */
-  .s6 { align-items: flex-start; }
+  /* end card */
   .logo { font-weight: 800; font-size: 11.5cqw; line-height: .9; letter-spacing: -.035em; margin: 0; }
   .logo .semi { color: var(--peach); }
   .tag { font-size: 3.3cqw; font-weight: 700; margin: 0; }
-  .ingredients { font-family: var(--mono); font-size: 1.6cqw; color: var(--dim); margin: 0; }
   .ring { position: absolute; right: 6cqw; bottom: 7cqw; width: 17cqw; aspect-ratio: 1; }
   .ring span { position: absolute; inset: 0; border: .35cqw solid var(--cyan); border-radius: 50%; opacity: 0; }
   .scene.on .ring span { animation: ping 2.4s ease-out infinite; animation-delay: var(--t); }
@@ -141,12 +120,14 @@
 
   @media (prefers-reduced-motion: reduce) {
     .scene, .scene.on { transition: none; }
-    .scene.on .up, .scene.on .wall-in, .scene.on .tldr, .scene.on .wave b,
-    .scene.on .printing div, .scene.on .ring span { animation: none; }
-    .scene.on .tldr { width: auto; }
-    .wave b { transform: scaleY(calc(var(--h) * .6)); }
+    .scene.on .up, .scene.on .typed, .scene.on .ghost .wl, .scene.on .ring span { animation: none; }
     .ring span { opacity: .4; }
   }
+
+  body.capture { padding: 0; }
+  body.capture .wrap { max-width: none; }
+  body.capture .stage { border: 0; border-radius: 0; }
+  body.capture .controls, body.capture .credit, body.capture .install { display: none; }
 
   .install { display: grid; gap: 10px; margin-top: 6px; }
   .install h2 { font-size: 20px; margin: 0; }
@@ -159,67 +140,66 @@
 <body>
 
 <div class="wrap">
-  <div class="stage" id="stage" aria-roledescription="animated advert" aria-label="TL;DR Voice advert">
+  <div class="stage" id="stage" aria-roledescription="animation" aria-label="How TL;DR Voice works">
     <div class="bar"><i></i><i></i><i></i><span>~/projects · claude</span></div>
 
-    <!-- 1: the problem -->
-    <section class="scene s1 on" data-ms="4600">
-      <div class="wall" aria-hidden="true"><div class="wall-in" id="wall"></div></div>
-      <div class="copy">
-        <p class="big">Long answers.<br><span class="peach">Tired eyes.</span></p>
-        <p class="small up" style="--t:1.2s">Your AI coding assistant writes a lot. You read all of it. Every time.</p>
+    <!-- 1: you ask -->
+    <section class="scene" data-ms="4200">
+      <p class="step up">Step 1</p>
+      <p class="mid up" style="--t:.1s">You ask Claude Code something.</p>
+      <div class="term up" style="--t:.3s">
+        <span class="prompt">❯</span> <span class="typed" style="--n:29;--t:.8s;--dur:1.5s">why does the login test fail?</span>
       </div>
     </section>
 
     <!-- 2: the TL;DR line -->
-    <section class="scene s2" data-ms="4400">
-      <p class="mid up">One line. <span class="peach">Always first.</span></p>
-      <div class="term up" style="--t:.2s">
-        <div><span class="prompt">❯</span> why is the living room TV silent?</div>
-        <span class="tldr">TL;DR: The stick is fine. Unplug the TV for a minute.</span>
+    <section class="scene" data-ms="5200">
+      <p class="step up">Step 2</p>
+      <p class="mid up" style="--t:.1s">The answer starts with <span class="peach">one short line.</span></p>
+      <div class="term up" style="--t:.3s">
+        <div><span class="prompt">❯</span> why does the login test fail?</div>
+        <span class="tldr typed" style="--n:53;--t:.8s;--dur:1.8s">TL;DR: It used an old password. Fixed, and it passes.</span>
         <div class="ghost" aria-hidden="true">
-          <div class="wl" style="width:82%"></div><div class="wl" style="width:64%"></div><div class="wl" style="width:73%"></div>
+          <div class="wl" style="width:82%;--t:2.8s"></div><div class="wl" style="width:64%;--t:3.1s"></div><div class="wl" style="width:73%;--t:3.4s"></div>
         </div>
       </div>
     </section>
 
     <!-- 3: the voice -->
-    <section class="scene s3" data-ms="5600">
-      <p class="mid up">…and it <span class="cyan">reads it out loud.</span></p>
-      <div class="printing" aria-hidden="true">
-        <div style="--t:.9s">Before that, I checked the audio driver on the stick…</div>
-        <div style="--t:1.5s">The signal leaves HDMI at a normal level, nothing is muted…</div>
-        <div style="--t:2.1s"><span class="peach">↑ already talking while the rest still prints</span></div>
+    <section class="scene" data-ms="5400">
+      <p class="step up">Step 3</p>
+      <p class="mid up" style="--t:.1s">A voice <span class="cyan">reads that line aloud.</span></p>
+      <p class="small up" style="--t:.9s">It starts about a second after the line appears, while the rest of the answer is still printing. Only that line is read.</p>
+      <p class="small up" style="--t:1.8s">Online voice by default. If it is slow or offline, a local voice takes over.</p>
+    </section>
+
+    <!-- 4: interrupt -->
+    <section class="scene" data-ms="5000">
+      <p class="step up">Want to reply?</p>
+      <p class="mid up" style="--t:.1s">Just start. <span class="peach">The voice stops.</span></p>
+      <div class="rows">
+        <div class="row up" style="--t:.7s"><span>Type your next message</span><span class="arrow">→</span><span>it goes quiet</span></div>
+        <div class="row up" style="--t:1.2s"><span>Hold <kbd>space</kbd> to talk</span><span class="arrow">→</span><span>it goes quiet</span></div>
       </div>
     </section>
 
-    <!-- 4: how fast -->
-    <section class="scene s4" data-ms="5800">
-      <p class="mid up">Built to keep up.</p>
-      <div class="stats">
-        <div class="stat up" style="--t:.3s"><span class="n">~1&nbsp;s</span><span class="l">from the summary line to the first spoken word</span></div>
-        <div class="stat up" style="--t:.6s"><span class="n">2×</span><span class="l">identical requests race; the faster voice wins</span></div>
-        <div class="stat up" style="--t:.9s"><span class="n">5&nbsp;s</span><span class="l">no voice yet? an offline voice takes over</span></div>
-        <div class="stat up" style="--t:1.2s"><span class="n">0</span><span class="l">words spoken by scheduled jobs running in the background</span></div>
-      </div>
-    </section>
-
-    <!-- 5: control -->
-    <section class="scene s5" data-ms="4600">
-      <p class="mid up">You stay in charge.</p>
+    <!-- 5: commands -->
+    <section class="scene" data-ms="5600">
+      <p class="step up">You stay in charge</p>
+      <p class="mid up" style="--t:.1s">Click <span class="peach">🔊</span> above the prompt to mute.</p>
       <div class="cmds">
-        <div class="up" style="--t:.3s"><code><span class="prompt">$</span> tldr-voice off</code><em>quiet mode</em></div>
-        <div class="up" style="--t:.7s"><code><span class="prompt">$</span> tldr-voice engine piper</code><em>fully offline voice</em></div>
-        <div class="up" style="--t:1.1s"><code><span class="prompt">$</span> tldr-voice stop-audio</code><em>hush, right now</em></div>
-        <div class="up" style="--t:1.5s"><em>…or just start typing — it stops talking.</em></div>
+        <div class="up" style="--t:.6s"><code><span class="prompt">/</span>tldr-voice:voice off | on</code><em>mute or unmute</em></div>
+        <div class="up" style="--t:.9s"><code><span class="prompt">/</span>tldr-voice:voice language de</code><em>German (or en)</em></div>
+        <div class="up" style="--t:1.2s"><code><span class="prompt">/</span>tldr-voice:voice engine piper</code><em>offline voice only</em></div>
+        <div class="up" style="--t:1.5s"><code><span class="prompt">/</span>tldr-voice:voice test</code><em>hear the voice</em></div>
       </div>
     </section>
 
     <!-- 6: end card -->
-    <section class="scene s6" data-ms="5200">
+    <section class="scene" data-ms="4600">
       <p class="logo up">TL<span class="semi">;</span>DR Voice</p>
-      <p class="tag up" style="--t:.35s">Your terminal, read aloud.</p>
-      <p class="ingredients up" style="--t:.7s">Claude Code hooks · neural voice · offline backup · built in one afternoon</p>
+      <p class="tag up" style="--t:.35s">Claude Code reads its summary line to you.</p>
+      <p class="small up" style="--t:.7s">A Claude Code plugin · English or German · Linux · free and open source</p>
       <div class="ring" aria-hidden="true">
         <span style="--t:0s"></span><span style="--t:.8s"></span><span style="--t:1.6s"></span><span class="dot"></span>
       </div>
@@ -233,12 +213,11 @@
     <button id="replay" class="ghostbtn" type="button">Replay</button>
     <div class="dots" id="dots" role="group" aria-label="Scenes"></div>
   </div>
-  <p class="credit">A home-made add-on for the Claude Code terminal: every answer opens with a one-line summary, and a voice reads it to you while the rest is still printing. Hooks plus a small background helper, with a local voice as backup.</p>
+  <p class="credit">Claude Code starts every answer with a one-line TL;DR, and a voice reads that line aloud while the rest is still printing. Typing or holding space stops it.</p>
   <section class="install">
     <h2>Try it</h2>
-    <pre><code>git clone https://github.com/d-shiri/tldr-voice.git
-cd tldr-voice &amp;&amp; ./install.sh</code></pre>
-    <p>Linux, Claude Code, Python 3 and mpv. Free, open source, no API keys.
+    <pre><code>/plugin install tldr-voice --marketplace d-shiri/tldr-voice</code></pre>
+    <p>In Claude Code, on Linux with Python 3 and mpv. Free, open source, no API keys.
        Source, docs and uninstall instructions: <a href="https://github.com/d-shiri/tldr-voice">github.com/d-shiri/tldr-voice</a></p>
   </section>
 </div>
@@ -281,10 +260,10 @@ function initThree(stage, reduce) {
   scene.add(field);
 
   //            amp   speed chaos ripple talk
-  const moods = [[0.55, 2.4, 1.0, 0.0, 0.0],   // 1 wall of text: restless
-                 [0.18, 0.7, 0.0, 0.0, 0.0],   // 2 TL;DR: calm
+  const moods = [[0.30, 0.9, 0.0, 0.0, 0.0],   // 1 you ask: calm
+                 [0.22, 0.7, 0.0, 0.0, 0.0],   // 2 TL;DR line: calm
                  [1.00, 1.4, 0.0, 0.0, 1.0],   // 3 voice: speech wave
-                 [0.45, 1.1, 0.0, 0.0, 0.4],   // 4 numbers
+                 [0.12, 0.5, 0.0, 0.0, 0.0],   // 4 interrupt: goes quiet
                  [0.20, 0.6, 0.0, 0.0, 0.0],   // 5 commands: calm
                  [0.70, 1.2, 0.0, 1.0, 0.0]];  // 6 end card: rings
   let cur = moods[0].slice(), target = moods[0];
@@ -336,14 +315,9 @@ function initThree(stage, reduce) {
   const dotsBox = document.getElementById('dots');
   const reduce = matchMedia('(prefers-reduced-motion: reduce)').matches;
 
-  // filler text for the opening wall
-  const wall = document.getElementById('wall');
-  for (let i = 0; i < 60; i++) {
-    const d = document.createElement('div');
-    d.className = 'wl' + (i % 5 === 0 ? ' t' : '');
-    d.style.width = (35 + ((i * 37) % 60)) + '%';
-    wall.appendChild(d);
-  }
+  // ?capture: only the stage, played once (used to record docs/demo.webp)
+  const capture = new URLSearchParams(location.search).has('capture');
+  if (capture) document.body.classList.add('capture');
   // 3D layer (Three.js): a field of glowing dots whose motion follows the scene
   const setMood = initThree(document.getElementById('stage'), reduce);
   const dots = scenes.map((_, i) => {
@@ -371,7 +345,8 @@ function initThree(stage, reduce) {
     if (playing) {
       const dur = +scenes[idx].dataset.ms;
       const t = now - start;
-      if (t >= dur) go(idx + 1); else paint(t / dur);
+      if (t >= dur) { if (capture && idx === scenes.length - 1) { playing = false; window.done = true; } else go(idx + 1); }
+      else paint(t / dur);
     }
     raf = requestAnimationFrame(tick);
   }

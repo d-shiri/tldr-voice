@@ -1,0 +1,15 @@
+{
+  "name": "tldr-voice",
+  "description": "tldr-voice: Claude Code reads the TL;DR line of every answer aloud.",
+  "owner": {
+    "name": "d-shiri",
+    "url": "https://github.com/d-shiri"
+  },
+  "plugins": [
+    {
+      "name": "tldr-voice",
+      "source": "./",
+      "description": "Claude Code reads the TL;DR line of every answer aloud. English or German."
+    }
+  ]
+}

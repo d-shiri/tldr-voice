@@ -1,0 +1,40 @@
+{
+  "name": "tldr-voice",
+  "version": "0.2.0",
+  "description": "Claude Code opens every answer with a one-line TL;DR and reads it aloud while the rest is still printing. English or German.",
+  "author": {
+    "name": "d-shiri",
+    "url": "https://github.com/d-shiri"
+  },
+  "homepage": "https://github.com/d-shiri/tldr-voice",
+  "repository": "https://github.com/d-shiri/tldr-voice",
+  "license": "MIT",
+  "keywords": [
+    "voice",
+    "tts",
+    "accessibility",
+    "hooks"
+  ],
+  "userConfig": {
+    "language": {
+      "type": "string",
+      "title": "Language",
+      "description": "Language of the spoken TL;DR line: en (English) or de (German). You can switch later with /tldr-voice:voice language de",
+      "options": [
+        "en",
+        "de"
+      ],
+      "default": "en"
+    }
+  },
+  "icon": ".claude-plugin/icon.png",
+  "network": {
+    "hosts": [
+      "speech.platform.bing.com",
+      "huggingface.co",
+      "pypi.org",
+      "files.pythonhosted.org"
+    ]
+  },
+  "types": "./types/index.d.ts"
+}
