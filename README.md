@@ -32,7 +32,7 @@
 
 In Claude Code:
 
-```text
+```bash
 /plugin install tldr-voice --marketplace d-shiri/tldr-voice
 ```
 
@@ -45,24 +45,27 @@ Pick **English** or **German** when asked, then restart Claude Code. On first st
 > sudo apt install mpv
 > ```
 
-<details>
+<details open>
 <summary><b>Claude Code older than 2.1.275?</b> Install in two steps</summary>
 
 <br>
 
-```text
+```bash
+# 1. Add the marketplace
 /plugin marketplace add d-shiri/tldr-voice
+
+# 2. Install the plugin
 /plugin install tldr-voice@tldr-voice
 ```
 
 </details>
 
-<details>
+<details open>
 <summary><b>Let Claude do it:</b> paste this prompt into Claude Code</summary>
 
 <br>
 
-```text
+```markdown
 Install the tldr-voice plugin for me: run `claude plugin marketplace add d-shiri/tldr-voice`
 and `claude plugin install tldr-voice@tldr-voice`, make sure python3 and mpv are installed
 (install mpv if missing), then tell me to restart Claude Code.
@@ -109,7 +112,7 @@ Set these in the `env` block of `~/.claude/settings.json`:
 
 ## Uninstall
 
-```text
+```bash
 /plugin uninstall tldr-voice@tldr-voice
 ```
 
