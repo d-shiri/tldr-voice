@@ -59,7 +59,8 @@ if $up; then ok "the hook's warm-up started the helper"; else fail "warm-up didn
 
 step "MessageDisplay hook speaks the TL;DR (online voice through the helper)"
 rm -f "$STATE/edge.log"
-line="Hello from the smoke test on $(uname -s). Grüße aus Köln!"
+# Plain words only: the plugin drops markdown symbols (Windows' uname has an underscore).
+line="Hello from the smoke test. Grüße aus Köln!"
 printf '{"index":0,"delta":"TL;DR: %s\\nMore text."}' "$line" | run display
 [ $? -eq 0 ] && ok "hook exited 0" || fail "display hook failed"
 spoken=""
