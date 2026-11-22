@@ -7,9 +7,34 @@ import type { EngineInterface, Register } from 'claude-code'
 
 const isOn = atom({ plugin: 'tldr-voice', key: 'isOn' } as const, null)
 
+async function isWindows($: EngineInterface): Promise<boolean> {
+  return (await $.session.info()).platform === 'windows'
+}
+
+// The same folder speak.py uses: Python's home on Windows is USERPROFILE, not HOME.
 async function flagPath($: EngineInterface): Promise<string> {
-  const state = (await $.env.get('XDG_STATE_HOME')) || `${await $.env.get('HOME')}/.local/state`
+  const home = (await isWindows($))
+    ? (await $.env.get('USERPROFILE')) || (await $.env.get('HOME'))
+    : await $.env.get('HOME')
+  const state = (await $.env.get('XDG_STATE_HOME')) || `${home}/.local/state`
   return `${state}/tldr-voice/disabled`
+}
+
+// Run speak.py with this system's Python 3. No shell here, so Windows tries the py
+// launcher, then python (`python3` there is usually the Microsoft Store placeholder).
+async function runSpeak($: EngineInterface, mode: string): Promise<number> {
+  const script = `${$.plugin.root}/scripts/speak.py`
+  const pythons = (await isWindows($)) ? [['py', '-3'], ['python']] : [['python3']]
+  for (const py of pythons) {
+    try {
+      const { exitCode } = await $.process.run([...py, script, mode])
+      // 103: the py launcher knows no Python 3 (e.g. one from uv), as in run.sh
+      if (!(py[0] === 'py' && exitCode === 103)) return exitCode
+    } catch {
+      // that Python isn't installed: try the next one
+    }
+  }
+  return 1
 }
 
 // Re-read the flag: the slash command may have changed it since the last look.
@@ -40,11 +65,7 @@ export const register: Register = on => {
 
     const toggle = async () => {
       const turnOn = !(await read($, isOn))
-      const { exitCode } = await $.process.run([
-        'python3',
-        `${$.plugin.root}/scripts/speak.py`,
-        turnOn ? 'on' : 'off',
-      ])
+      const exitCode = await runSpeak($, turnOn ? 'on' : 'off')
 
       if (exitCode === 0) {
         await update($, isOn, () => turnOn)

@@ -5,7 +5,7 @@ Hook modes (first argument, hook JSON on stdin), wired up in hooks/hooks.json:
   session  SessionStart:     remember the data folder; set up the voices in the background
   prompt   UserPromptSubmit: stop speech, warm up the voice, remind Claude of the TL;DR line
   display  MessageDisplay:   speak the TL;DR as soon as it streams in at the top of a reply
-  stop     Stop:             backup: speak the TL;DR if it wasn't spoken while streaming
+  reply-end Stop:            backup: speak the TL;DR if it wasn't spoken while streaming
 
 Control modes (/tldr-voice:voice <mode>):
   on | off | status | stop | engine edge|piper | language en|de | test [TEXT] | setup
@@ -14,6 +14,7 @@ Uses only the Python standard library, so hooks start fast. The voices (edge-tts
 live in their own environment in the plugin's data folder, built on first use.
 Only interactive sessions speak; headless and scheduled `claude -p` runs stay silent.
 """
+import io
 import json
 import os
 import re
@@ -25,6 +26,18 @@ import sys
 import time
 import urllib.request
 from pathlib import Path
+
+MACOS = sys.platform == "darwin"
+WINDOWS = os.name == "nt"
+# Windows Python has no Unix sockets, so there the voice helper listens on a local TCP
+# port. TLDR_VOICE_TCP=1 forces that path elsewhere, to test it off Windows.
+TCP = WINDOWS or os.environ.get("TLDR_VOICE_TCP") == "1"
+if MACOS:
+    # Homebrew's mpv and uv live here, and Claude Code isn't always started from a shell
+    # that has them on PATH. The voice helper and players inherit this PATH too.
+    _path = os.environ.get("PATH", "").split(os.pathsep)
+    os.environ["PATH"] = os.pathsep.join(
+        _path + [d for d in ("/opt/homebrew/bin", "/usr/local/bin") if d not in _path])
 
 HOME = Path.home()
 CODE = Path(__file__).resolve().parent
@@ -39,15 +52,17 @@ def data_dir() -> Path:
     if env:
         return Path(env)
     try:
-        return Path(DATA_POINTER.read_text().strip())
+        return Path(DATA_POINTER.read_text(encoding="utf-8").strip())
     except OSError:
         return Path(os.environ.get("XDG_DATA_HOME") or HOME / ".local/share") / "tldr-voice"
 
 
 DATA = data_dir()
 VENV = DATA / "venv"
-VENV_PY = VENV / "bin/python"
-PIPER = VENV / "bin/piper"
+EXE = ".exe" if WINDOWS else ""
+VENV_BIN = VENV / ("Scripts" if WINDOWS else "bin")
+VENV_PY = VENV_BIN / f"python{EXE}"
+PIPER = VENV_BIN / f"piper{EXE}"
 VOICES_DIR = DATA / "voices"
 SETUP_VERSION = "2"                      # bump to rebuild the environment on update
 READY = VENV / f".tldr-voice-ready-{SETUP_VERSION}"
@@ -59,11 +74,58 @@ DAEMON = CODE / "edge_daemon.py"
 # The number changes when the helper's protocol does, so an old helper is never reused.
 SOCK = (Path(os.environ["XDG_RUNTIME_DIR"]) / "tldr-voice-2.sock"
         if os.environ.get("XDG_RUNTIME_DIR") else STATE / "edge-2.sock")
+# With TCP the helper writes "<port> <key>" here; a command without the key is ignored,
+# so only someone who can read this user's state folder can make it speak.
+PORT_FILE = STATE / "edge-2.port"
 OFF_FLAG = STATE / "disabled"
 ENGINE_FILE = STATE / "engine"          # "edge" (default) or "piper"
 LANGUAGE_FILE = STATE / "language"      # "en" or "de"; overrides the install-time choice
 PID_FILE = STATE / "speaking.pid"       # process group of local (Piper) playback
 LAST_FILE = STATE / "last_spoken.txt"   # avoids speaking the same TL;DR twice
+
+# Linux can play the offline voice without mpv (paplay or aplay); macOS and Windows can't.
+if MACOS:
+    MPV_INSTALL = "Install it with: brew install mpv"
+elif WINDOWS:
+    MPV_INSTALL = "Install it with: winget install shinchiro.mpv (then restart Claude Code)"
+else:
+    MPV_INSTALL = "Install it with your package manager, e.g. sudo apt install mpv"
+
+
+def mpv_missing() -> str:
+    if not (MACOS or WINDOWS) and (shutil.which("paplay") or shutil.which("aplay")):
+        return "mpv is not installed, so only the offline voice can play."
+    return "mpv is not installed, so no voice can play."
+
+
+# ---------- processes ----------
+
+def detached() -> dict:
+    """Popen options for a process that outlives the hook, in a process group of its own
+    (so it can be stopped as one, and Ctrl+C in the terminal doesn't reach it), with no
+    console window on Windows."""
+    if WINDOWS:
+        return {"creationflags": getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+                | getattr(subprocess, "CREATE_NO_WINDOW", 0)}
+    return {"start_new_session": True}
+
+
+def kill_tree(pid: int) -> None:
+    """Stop a detached process and everything it started."""
+    try:
+        if WINDOWS:
+            subprocess.run(["taskkill", "/T", "/F", "/PID", str(pid)],
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                           creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        else:
+            os.killpg(pid, signal.SIGTERM)
+    except OSError:
+        pass
+
+
+def utf8_env() -> dict:
+    """Environment for Piper: Windows Python reads stdin in the ANSI code page unless told."""
+    return {**os.environ, "PYTHONUTF8": "1"}
 
 PIPER_BASE = "https://huggingface.co/rhasspy/piper-voices/resolve/v1.0.0/"
 LANGUAGES = {
@@ -94,7 +156,7 @@ def interactive() -> bool:
 
 def read(path: Path, default: str = "") -> str:
     try:
-        return path.read_text().strip() or default
+        return path.read_text(encoding="utf-8", errors="replace").strip() or default
     except OSError:
         return default
 
@@ -127,10 +189,51 @@ def ready() -> bool:
 
 
 def find_uv() -> str:
-    for c in (shutil.which("uv"), HOME / ".local/bin/uv", HOME / ".cargo/bin/uv"):
+    for c in (shutil.which("uv"), HOME / f".local/bin/uv{EXE}", HOME / f".cargo/bin/uv{EXE}"):
         if c and Path(c).exists():
             return str(c)
     return ""
+
+
+PREFERRED_PYTHONS = ("3.13", "3.12", "3.11", "3.10", "3.14")
+
+
+def venv_pythons() -> list:
+    """Pythons to build the voice environment with when uv isn't there, best first.
+
+    The offline voice needs onnxruntime, whose builds trail new Python releases (none for
+    3.15 yet), so a well-supported version comes before the running Python. macOS's
+    built-in python3 is 3.9, which gets only older onnxruntime builds. On Windows the
+    versions are found through the py launcher, since there are no pythonX.Y commands."""
+    found = []
+    for v in PREFERRED_PYTHONS:
+        exe = shutil.which(f"python{v}")
+        if not exe and WINDOWS and shutil.which("py"):
+            r = subprocess.run(["py", f"-{v}", "-c", "import sys; print(sys.executable)"],
+                               capture_output=True, text=True)
+            exe = r.stdout.strip() if r.returncode == 0 else None
+        if exe:
+            found.append(exe)
+    found.append(sys.executable)
+    return list(dict.fromkeys(found))  # each once, in order
+
+
+def build_venv_with_pip(stamp) -> None:
+    """Build VENV and install the voices with the first Python that manages both. One may
+    fail to make a venv (Debian's missing pythonX.Y-venv, a pyenv shim) or have no
+    onnxruntime build for the offline voice; then the next one gets its turn."""
+    tried = []
+    for py in venv_pythons():
+        tried.append(py)
+        if subprocess.run([py, "-m", "venv", "--clear", str(VENV)]).returncode != 0:
+            stamp(f"{py} can't make the voice environment; trying another Python")
+            continue
+        if subprocess.run([str(VENV_PY), "-m", "pip", "install", "-q", "--upgrade",
+                           "pip", "edge-tts", "piper-tts"]).returncode == 0:
+            return
+        stamp(f"the voices don't install on {py}; trying another Python")
+    raise RuntimeError(f"no Python here can build the voices (tried {', '.join(tried)}). "
+                       "Install uv, or Python 3.12 or 3.13.")
 
 
 def ensure_setup() -> bool:
@@ -146,7 +249,7 @@ def ensure_setup() -> bool:
     with open(SETUP_LOG, "a") as log:
         subprocess.Popen([sys.executable, str(Path(__file__).resolve()), "setup"],
                          stdin=subprocess.DEVNULL, stdout=log, stderr=log,
-                         start_new_session=True, env={**os.environ, "CLAUDE_PLUGIN_DATA": str(DATA)})
+                         env={**os.environ, "CLAUDE_PLUGIN_DATA": str(DATA)}, **detached())
     return False
 
 
@@ -164,6 +267,7 @@ def run_setup() -> int:
     stamp = lambda msg: print(time.strftime("%Y-%m-%d %H:%M:%S"), msg, flush=True)  # noqa: E731
     try:
         if not (READY.exists() and VENV_PY.exists()):
+            stop_helper()  # Windows can't replace the venv's python.exe while it runs
             stamp(f"creating the voice environment in {VENV}")
             uv = find_uv()
             if uv:
@@ -171,9 +275,7 @@ def run_setup() -> int:
                 subprocess.run([uv, "pip", "install", "-q", "--python", str(VENV_PY), "--upgrade",
                                 "edge-tts", "piper-tts"], check=True)
             else:
-                subprocess.run([sys.executable, "-m", "venv", str(VENV)], check=True)
-                subprocess.run([str(VENV_PY), "-m", "pip", "install", "-q", "--upgrade",
-                                "pip", "edge-tts", "piper-tts"], check=True)
+                build_venv_with_pip(stamp)
             for old in VENV.glob(".tldr-voice-ready-*"):
                 old.unlink()
             READY.touch()
@@ -185,10 +287,9 @@ def run_setup() -> int:
             for suffix in (".onnx.json", ".onnx"):  # the .onnx last: its presence means "done"
                 part = VOICES_DIR / (model.name.replace(".onnx", "") + suffix + ".part")
                 urllib.request.urlretrieve(PIPER_BASE + path + suffix, part)
-                part.rename(VOICES_DIR / (model.name.replace(".onnx", "") + suffix))
+                part.replace(VOICES_DIR / (model.name.replace(".onnx", "") + suffix))
         if not shutil.which("mpv"):
-            stamp("note: mpv is not installed, so only the offline voice can play. "
-                  "Install mpv for the online voice.")
+            stamp(f"note: {mpv_missing()} {MPV_INSTALL}")
         stamp("ready")
         return 0
     except Exception as e:  # noqa: BLE001 - reported in the log and in /tldr-voice:voice status
@@ -216,45 +317,126 @@ def extract_tldr(message: str) -> str:
     return ""
 
 
-def daemon_send(msg: dict, start: bool) -> bool:
-    """Send one command to the warm Edge-voice helper; optionally start it first."""
-    payload = (json.dumps(msg) + "\n").encode()
-    for attempt in range(40 if start else 1):
+def daemon_connect() -> "tuple[socket.socket, str]":
+    """A connection to the running helper and the key it expects. Raises OSError (or
+    ValueError for a garbled port file) when there is none."""
+    if TCP:
+        # No port file means no helper: fail at once, since a refused local TCP connect
+        # can take Windows a second or two.
+        port, key = PORT_FILE.read_text(encoding="utf-8").split()
+        return socket.create_connection(("127.0.0.1", int(port)), timeout=1), key
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    s.settimeout(1)
+    try:
+        s.connect(str(SOCK))
+    except OSError:
+        s.close()
+        raise
+    return s, ""
+
+
+def daemon_send(msg: dict, start: bool, wait: "float | None" = None) -> bool:
+    """Send one command to the warm Edge-voice helper; optionally start it first. `wait` caps
+    how long to wait for a freshly started helper (0: start it and don't wait)."""
+    started = False
+    if wait is None:
+        wait = 5 if WINDOWS else 2  # Windows starts Python slower
+    deadline = time.monotonic() + wait
+    while True:
+        stale = False  # nothing (or not our helper) answers at the address in PORT_FILE
         try:
-            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
-                s.settimeout(1)
-                s.connect(str(SOCK))
-                s.sendall(payload)
-                s.recv(8)
+            try:
+                s, key = daemon_connect()
+            except (ConnectionError, socket.timeout):
+                stale = True  # a refused local connect times out on Windows
+                raise
+            with s:
+                s.sendall((json.dumps({**msg, "key": key}) + "\n").encode())
+                if not s.recv(8).startswith(b"ok"):
+                    stale = True  # another program took the port, or the key is old
+                    raise ConnectionError("no answer from the voice helper")
             return True
-        except OSError:
+        except (OSError, ValueError):
             if not start or not VENV_PY.exists():
                 return False
-            if attempt == 0:
+            if not started:  # start it before looking at the clock, so wait=0 still starts it
+                if TCP and stale:
+                    PORT_FILE.unlink(missing_ok=True)  # left behind by a helper that died
                 subprocess.Popen([str(VENV_PY), "-I", str(DAEMON)],
                                  stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-                                 stderr=subprocess.DEVNULL, start_new_session=True,
-                                 env={**os.environ, "CLAUDE_PLUGIN_DATA": str(DATA)})
+                                 stderr=subprocess.DEVNULL,
+                                 env={**os.environ, "CLAUDE_PLUGIN_DATA": str(DATA)}, **detached())
+                started = True
+            if time.monotonic() > deadline:
+                return False
             time.sleep(0.05)
-    return False
+
+
+def stop_helper() -> None:
+    """Ask a running helper to exit, and give it a moment to be gone."""
+    if not daemon_send({"cmd": "quit"}, start=False):
+        return
+    address = PORT_FILE if TCP else SOCK
+    for _ in range(30):  # the helper removes its address as it exits
+        if not address.exists():
+            break
+        time.sleep(0.1)
+    time.sleep(0.5)  # and then the process ends, releasing its files
 
 
 def stop_audio() -> None:
     daemon_send({"cmd": "stop"}, start=False)
     try:
-        os.killpg(int(PID_FILE.read_text().strip()), signal.SIGTERM)
+        kill_tree(int(PID_FILE.read_text().strip()))
     except (OSError, ValueError):
         pass
     PID_FILE.unlink(missing_ok=True)
 
 
-def piper_command(model: Path) -> str:
-    """Shell pipeline that reads $1 aloud with the local Piper voice."""
-    rate = "22050"
+def piper_rate(model: Path) -> str:
     try:
-        rate = str(json.loads(Path(str(model) + ".json").read_text())["audio"]["sample_rate"])
+        return str(json.loads(Path(str(model) + ".json").read_text())["audio"]["sample_rate"])
     except (OSError, ValueError, KeyError):
-        pass
+        return "22050"
+
+
+def piper_argv(model: Path) -> list:
+    return [str(PIPER), "-m", str(model), "--output-raw"]
+
+
+def raw_player_argv(rate: str) -> list:
+    """mpv playing Piper's raw 16-bit mono audio from stdin."""
+    return [shutil.which("mpv") or "mpv", "--really-quiet", "--no-video", "--demuxer=rawaudio",
+            f"--demuxer-rawaudio-rate={rate}", "--demuxer-rawaudio-channels=1",
+            "--demuxer-rawaudio-format=s16le", "-"]
+
+
+def play_piper(text: str) -> int:
+    """Read text aloud with Piper into mpv, without a shell (Windows has no `sh`). The two
+    processes are joined by a pipe; this process waits, so stopping it as a tree stops both."""
+    model = piper_model()
+    r, w = os.pipe()
+    try:
+        player = subprocess.Popen(raw_player_argv(piper_rate(model)), stdin=r,
+                                  stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    finally:
+        os.close(r)
+    try:
+        piper = subprocess.Popen(piper_argv(model), stdin=subprocess.PIPE, stdout=w,
+                                 stderr=subprocess.DEVNULL, env=utf8_env())
+    finally:
+        os.close(w)
+    piper.communicate(text.encode("utf-8"))
+    rc = player.wait()
+    # Done: forget this pid, so a later stop can't hit another process that reuses it.
+    if read(PID_FILE) == str(os.getpid()):
+        PID_FILE.unlink(missing_ok=True)
+    return rc
+
+
+def piper_command(model: Path) -> str:
+    """Shell pipeline that reads $1 aloud with the local Piper voice (Linux and macOS)."""
+    rate = piper_rate(model)
     if shutil.which("paplay"):
         player = f"paplay --raw --rate={rate} --channels=1 --format=s16le"
     elif shutil.which("aplay"):
@@ -273,13 +455,20 @@ def speak(text: str) -> None:
     if not text or not ensure_setup():
         return
     stop_audio()
-    LAST_FILE.write_text(text)
+    LAST_FILE.write_text(text, encoding="utf-8")
     msg = {"cmd": "speak", "text": text, "voice": edge_voice(), "piper_model": str(piper_model()),
            "mic_stop": mic_stop_enabled()}
     # Edge voice: the warm helper streams audio as it arrives and falls back to Piper itself.
     if engine() == "edge" and shutil.which("mpv") and daemon_send(msg, start=True):
         return
     if not PIPER.exists():
+        return
+    if WINDOWS:
+        # No shell pipeline here: a detached copy of this script joins Piper to mpv.
+        proc = subprocess.Popen([sys.executable, str(Path(__file__).resolve()), "play-piper", text],
+                                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                                stderr=subprocess.DEVNULL, **detached())
+        PID_FILE.write_text(str(proc.pid))
         return
     # Same rule as the Edge helper: when any app opens the microphone (hold-space voice
     # input), stop. The watcher and the voice share a process group; `kill 0` ends both.
@@ -313,8 +502,11 @@ def status() -> str:
     lines = [f"tldr-voice: {'off' if OFF_FLAG.exists() else 'on'} | language: {language()} | "
              f"engine: {engine()} | voices: {setup}"]
     if not shutil.which("mpv"):
-        lines.append("mpv is not installed, so the online voice can't play; the offline voice is used.")
-    if not shutil.which("pactl"):
+        lines.append(f"{mpv_missing()} {MPV_INSTALL}")
+    if MACOS or WINDOWS:
+        lines.append(f"On {'macOS' if MACOS else 'Windows'}, holding space to talk doesn't stop "
+                     "the voice (typing still does).")
+    elif not shutil.which("pactl"):
         lines.append("pactl not found, so holding space to talk won't stop the voice (typing still does).")
     return "\n".join(lines)
 
@@ -345,25 +537,30 @@ def control(mode: str, args: list) -> int:
         speak(" ".join(args) or TEST_LINE[language()]); print("tldr-voice: speaking"); return 0
     if mode == "setup":
         return run_setup()
+    if mode == "play-piper":  # internal: the Windows offline voice, started by speak()
+        return play_piper(" ".join(args))
     print(__doc__); return 0 if mode in ("help", "-h", "--help") else 2
 
 
 # ---------- entry point ----------
 
 def main() -> int:
+    if WINDOWS and isinstance(sys.stdout, io.TextIOWrapper):
+        sys.stdout.reconfigure(encoding="utf-8")  # UTF-8 like everywhere else, not the code page
     STATE.mkdir(parents=True, exist_ok=True)
     mode = sys.argv[1] if len(sys.argv) > 1 else ""
-    if mode not in ("session", "prompt", "display", "stop"):
+    # "stop" is the voice command (/tldr-voice:voice stop); the Stop hook is "reply-end".
+    if mode not in ("session", "prompt", "display", "reply-end"):
         return control(mode, sys.argv[2:])
 
     if os.environ.get("CLAUDE_PLUGIN_DATA"):
         try:  # let the helper and the control command find the data folder
             if read(DATA_POINTER) != str(DATA):
-                DATA_POINTER.write_text(str(DATA))
+                DATA_POINTER.write_text(str(DATA), encoding="utf-8")
         except OSError:
             pass
-    try:
-        data = json.load(sys.stdin)
+    try:  # bytes, so json decodes UTF-8 whatever the system's code page
+        data = json.loads(sys.stdin.buffer.read() or b"{}")
     except ValueError:
         data = {}
 
@@ -375,9 +572,10 @@ def main() -> int:
         stop_audio()
         LAST_FILE.unlink(missing_ok=True)
         if interactive() and not OFF_FLAG.exists():
+            print(REMINDER[language()], flush=True)  # first: this hook has only 5 s
             if engine() == "edge" and ready():
-                daemon_send({"cmd": "warm", "voice": edge_voice()}, start=True)  # warm up while Claude works
-            print(REMINDER[language()])
+                # Warm up while Claude works; a helper that isn't up yet starts without waiting.
+                daemon_send({"cmd": "warm", "voice": edge_voice()}, start=True, wait=0)
         return 0
 
     if not interactive() or OFF_FLAG.exists():
@@ -387,7 +585,7 @@ def main() -> int:
         if int(data.get("index", 99)) > 2:   # only the first lines of a message
             return 0
         text = data.get("delta") or ""
-    else:  # stop
+    else:  # reply-end
         text = data.get("last_assistant_message") or ""
 
     tldr = extract_tldr(text)

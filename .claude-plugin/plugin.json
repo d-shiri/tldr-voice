@@ -1,6 +1,6 @@
 {
   "name": "tldr-voice",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Claude Code opens every answer with a one-line TL;DR and reads it aloud while the rest is still printing. English or German.",
   "author": {
     "name": "d-shiri",
@@ -13,7 +13,9 @@
     "voice",
     "tts",
     "accessibility",
-    "hooks"
+    "hooks",
+    "macos",
+    "windows"
   ],
   "userConfig": {
     "language": {

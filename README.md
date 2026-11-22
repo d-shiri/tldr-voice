@@ -12,7 +12,7 @@
 <p align="center">
   <img alt="Claude Code plugin" src="https://img.shields.io/badge/Claude_Code-plugin-D97757">
   <img alt="Version" src="https://img.shields.io/badge/dynamic/json?url=https%3A%2F%2Fraw.githubusercontent.com%2Fd-shiri%2Ftldr-voice%2Fmain%2F.claude-plugin%2Fplugin.json&query=%24.version&label=version&color=5BC8DC">
-  <img alt="Linux" src="https://img.shields.io/badge/platform-Linux-informational">
+  <img alt="Linux, macOS and Windows" src="https://img.shields.io/badge/platform-Linux_%7C_macOS_%7C_Windows-informational">
   <img alt="English and German" src="https://img.shields.io/badge/voice-EN_%7C_DE-blueviolet">
   <a href="LICENSE"><img alt="MIT license" src="https://img.shields.io/badge/license-MIT-green"></a>
 </p>
@@ -39,11 +39,15 @@ In Claude Code:
 Pick **English** or **German** when asked, then restart Claude Code. On first start the plugin sets up its voices in the background, which takes about a minute. After that, every answer is read aloud.
 
 > [!IMPORTANT]
-> Needs **Linux** with **Python 3** and [`mpv`](https://mpv.io). [`uv`](https://docs.astral.sh/uv/) makes setup faster. macOS is untested.
+> Needs **Python 3** and [`mpv`](https://mpv.io) on **Linux**, **macOS** or **Windows**. [`uv`](https://docs.astral.sh/uv/) makes setup faster.
 >
 > ```bash
-> sudo apt install mpv
+> sudo apt install mpv     # Linux (Debian, Ubuntu)
+> brew install mpv uv      # macOS, with Homebrew
+> winget install Git.Git Python.Python.3.12 shinchiro.mpv astral-sh.uv   # Windows
 > ```
+>
+> On macOS, `python3` comes with the Xcode command line tools (`xcode-select --install`). On Windows, the hooks run in Git Bash, so Git for Windows is required; restart Claude Code after installing. Under WSL it runs like Linux.
 
 **Claude Code older than 2.1.275?** Install in two steps:
 
@@ -60,7 +64,8 @@ Pick **English** or **German** when asked, then restart Claude Code. On first st
 ```markdown
 Install the tldr-voice plugin for me: run `claude plugin marketplace add d-shiri/tldr-voice`
 and `claude plugin install tldr-voice@tldr-voice`, make sure python3 and mpv are installed
-(install mpv if missing), then tell me to restart Claude Code.
+(install mpv if missing: apt on Linux, Homebrew on macOS, winget on Windows, where Git for
+Windows is needed too), then tell me to restart Claude Code.
 ```
 
 ## Use
@@ -77,7 +82,7 @@ Click the 🔊 icon above the prompt to mute or unmute, or use the command:
 | `/tldr-voice:voice status` | Show the current settings |
 
 > [!TIP]
-> Typing your next message stops the voice, and so does holding space to talk. The hold-space stop needs `pactl` (PulseAudio or PipeWire).
+> Typing your next message stops the voice, and so does holding space to talk. The hold-space stop needs `pactl` (PulseAudio or PipeWire), so it works on Linux only.
 
 ### Settings
 

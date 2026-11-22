@@ -9,7 +9,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/speak.py\" session",
+            "command": "sh \"${CLAUDE_PLUGIN_ROOT}/scripts/run.sh\" session",
             "timeout": 10
           }
         ]
@@ -20,7 +20,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/speak.py\" prompt",
+            "command": "sh \"${CLAUDE_PLUGIN_ROOT}/scripts/run.sh\" prompt",
             "timeout": 5
           }
         ]
@@ -31,7 +31,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/speak.py\" display",
+            "command": "sh \"${CLAUDE_PLUGIN_ROOT}/scripts/run.sh\" display",
             "timeout": 10,
             "async": true
           }
@@ -43,7 +43,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/speak.py\" stop",
+            "command": "sh \"${CLAUDE_PLUGIN_ROOT}/scripts/run.sh\" reply-end",
             "timeout": 30,
             "async": true
           }
