@@ -1,10 +1,12 @@
 """tldr-voice helper for the Microsoft Edge neural voice. Runs in tldr-voice's own venv.
 
-Listens on a Unix socket for one-line JSON commands from speak.py:
+Listens on a Unix socket (on Windows: a local TCP port, with a key) for one-line JSON
+commands from speak.py:
   {"cmd": "speak", "text": "...", "voice": "...", "piper_model": "...", "mic_stop": true}
                                    stream audio straight into mpv (latest wins)
   {"cmd": "stop"}                  silence current speech
   {"cmd": "warm", "voice": "..."}  tiny throwaway request so the next one is fast
+  {"cmd": "quit"}                  stop and exit (setup is rebuilding the environment)
 
 Identical requests race and the first to answer is played; while none has answered,
 a fresh one joins every HEDGE_EVERY seconds. This cuts the slow tail of the free
@@ -14,6 +16,7 @@ fails, the local Piper voice speaks instead. Exits after 30 min idle.
 import asyncio
 import json
 import os
+import secrets
 import shutil
 import sys
 import time
@@ -36,6 +39,20 @@ FIRST_AUDIO_TIMEOUT = 8.0  # seconds without audio -> local Piper voice instead
 current: "asyncio.Task | None" = None
 procs: set = set()
 last_used = 0.0
+quitting: "asyncio.Event | None" = None  # made in main(): an Event belongs to its loop
+KEY = secrets.token_hex(16) if cfg.TCP else ""  # TCP only: commands must carry it
+
+
+def end(p) -> None:
+    """Stop one player process: its whole group on Linux/macOS (the Piper fallback is a
+    shell pipeline there); on Windows every process is started and tracked on its own."""
+    try:
+        if cfg.WINDOWS:
+            p.kill()
+        else:
+            os.killpg(p.pid, 15)
+    except OSError:
+        pass
 
 
 def log(line: str) -> None:
@@ -50,10 +67,7 @@ def log(line: str) -> None:
 
 def kill_procs() -> None:
     for p in list(procs):
-        try:
-            os.killpg(p.pid, 15)
-        except OSError:
-            pass
+        end(p)
     procs.clear()
 
 
@@ -64,10 +78,7 @@ async def spawn(*args, **kw) -> asyncio.subprocess.Process:
 
     def reap(t: asyncio.Future) -> None:
         if not t.cancelled() and t.exception() is None:
-            try:
-                os.killpg(t.result().pid, 15)
-            except OSError:
-                pass
+            end(t.result())
 
     try:
         p = await asyncio.shield(task)
@@ -81,6 +92,9 @@ async def spawn(*args, **kw) -> asyncio.subprocess.Process:
 async def piper_fallback(text: str, model: Path) -> None:
     if not PIPER.exists() or not model.exists():
         return
+    if cfg.WINDOWS:
+        await piper_fallback_windows(text, model)
+        return
     p = await spawn(
         "sh", "-c", cfg.piper_command(model), "piper", text,
         stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL, start_new_session=True)
@@ -88,6 +102,31 @@ async def piper_fallback(text: str, model: Path) -> None:
         await p.wait()  # keep speak() running while Piper talks, so the mic watch covers it
     finally:
         procs.discard(p)
+
+
+async def piper_fallback_windows(text: str, model: Path) -> None:
+    """Windows has no `sh`: start Piper and mpv joined by a pipe, each tracked in procs."""
+    dn = asyncio.subprocess.DEVNULL
+    r, w = os.pipe()
+    try:
+        player = await spawn(*cfg.raw_player_argv(cfg.piper_rate(model)),
+                             stdin=r, stdout=dn, stderr=dn, **cfg.detached())
+    finally:
+        os.close(r)
+    try:
+        piper = await spawn(*cfg.piper_argv(model), stdin=asyncio.subprocess.PIPE, stdout=w,
+                            stderr=dn, env=cfg.utf8_env(), **cfg.detached())
+    finally:
+        os.close(w)
+    try:
+        assert piper.stdin is not None
+        piper.stdin.write(text.encode("utf-8"))
+        await piper.stdin.drain()
+        piper.stdin.close()
+        await player.wait()
+    finally:
+        procs.discard(player)
+        procs.discard(piper)
 
 
 async def mic_opened(enabled: bool) -> bool:
@@ -212,10 +251,10 @@ async def speak(text: str, voice: str, piper_model: Path) -> None:
     t0 = asyncio.get_running_loop().time()
     # Start the player and the request together; feed audio in as it streams.
     player = await spawn(
-        "mpv", "--no-video", "--really-quiet", "--cache=no", "--demuxer-lavf-format=mp3",
-        "--audio-buffer=0.1", "-",
+        shutil.which("mpv") or "mpv", "--no-video", "--really-quiet", "--cache=no",
+        "--demuxer-lavf-format=mp3", "--audio-buffer=0.1", "-",
         stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.DEVNULL,
-        stderr=asyncio.subprocess.DEVNULL, start_new_session=True)
+        stderr=asyncio.subprocess.DEVNULL, **cfg.detached())
     assert player.stdin is not None
     got_audio = False
     try:
@@ -267,12 +306,17 @@ async def handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> 
         msg = json.loads((await reader.readline()) or b"{}")
     except ValueError:
         msg = {}
+    if KEY and not secrets.compare_digest(str(msg.get("key", "")), KEY):
+        writer.close()  # not from speak.py: another program found the port
+        return
     cmd = msg.get("cmd")
     if cmd == "speak" and msg.get("text"):
         await stop_current()
         current = asyncio.create_task(speak_until_mic(msg))
-    elif cmd == "stop":
+    elif cmd in ("stop", "quit"):
         await stop_current()
+        if cmd == "quit" and quitting:  # setup is about to rebuild the venv we run from
+            quitting.set()
     elif cmd == "warm" and not (current and not current.done()):
         asyncio.create_task(warm(msg.get("voice") or DEFAULT_VOICE))
     writer.write(b"ok\n")
@@ -281,17 +325,34 @@ async def handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> 
 
 
 async def main() -> None:
-    global last_used
+    global last_used, quitting
+    quitting = asyncio.Event()
     STATE.mkdir(parents=True, exist_ok=True)
-    SOCK.unlink(missing_ok=True)
-    server = await asyncio.start_unix_server(handle, path=str(SOCK))
-    os.chmod(SOCK, 0o600)
+    mine = ""
+    if cfg.TCP:
+        server = await asyncio.start_server(handle, "127.0.0.1", 0)
+        port = server.sockets[0].getsockname()[1]
+        mine = f"{port} {KEY}"
+        tmp = cfg.PORT_FILE.with_suffix(f".{os.getpid()}.tmp")  # helpers started together
+        tmp.write_text(mine, encoding="utf-8")
+        tmp.replace(cfg.PORT_FILE)  # written whole, only once the port is listening
+    else:
+        SOCK.unlink(missing_ok=True)
+        server = await asyncio.start_unix_server(handle, path=str(SOCK))
+        os.chmod(SOCK, 0o600)
     loop = asyncio.get_running_loop()
     last_used = loop.time()
     async with server:
-        while loop.time() - last_used < IDLE_EXIT:
-            await asyncio.sleep(30)
-    SOCK.unlink(missing_ok=True)
+        while loop.time() - last_used < IDLE_EXIT and not quitting.is_set():
+            try:
+                await asyncio.wait_for(quitting.wait(), 30)
+            except asyncio.TimeoutError:
+                pass
+    if cfg.TCP:
+        if cfg.read(cfg.PORT_FILE) == mine:  # a newer helper may have taken over
+            cfg.PORT_FILE.unlink(missing_ok=True)
+    else:
+        SOCK.unlink(missing_ok=True)
 
 
 if __name__ == "__main__":
