@@ -26,11 +26,12 @@ fi
 # A value from speak.py itself, so the test reads the same paths the plugin uses.
 speak_value() { py -c "import sys; sys.path.insert(0, 'scripts'); import speak; print($1)"; }
 
-alive() {  # is this process still running?
+alive() {  # is this process, or on Linux/macOS anything in its process group, still running?
   if $windows; then
     MSYS_NO_PATHCONV=1 tasklist /FI "PID eq $1" /NH 2>/dev/null | grep -qw "$1"
   else
-    kill -0 "$1" 2>/dev/null
+    # Zombies don't count: a stopped orphan may wait a while for its parent to reap it.
+    ps -eo pgid=,stat= | awk -v g="$1" '$1 == g && $2 !~ /^Z/ { found = 1 } END { exit !found }'
   fi
 }
 

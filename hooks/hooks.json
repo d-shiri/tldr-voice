@@ -43,7 +43,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "sh \"${CLAUDE_PLUGIN_ROOT}/scripts/run.sh\" stop",
+            "command": "sh \"${CLAUDE_PLUGIN_ROOT}/scripts/run.sh\" reply-end",
             "timeout": 30,
             "async": true
           }

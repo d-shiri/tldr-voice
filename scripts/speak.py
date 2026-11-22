@@ -5,7 +5,7 @@ Hook modes (first argument, hook JSON on stdin), wired up in hooks/hooks.json:
   session  SessionStart:     remember the data folder; set up the voices in the background
   prompt   UserPromptSubmit: stop speech, warm up the voice, remind Claude of the TL;DR line
   display  MessageDisplay:   speak the TL;DR as soon as it streams in at the top of a reply
-  stop     Stop:             backup: speak the TL;DR if it wasn't spoken while streaming
+  reply-end Stop:            backup: speak the TL;DR if it wasn't spoken while streaming
 
 Control modes (/tldr-voice:voice <mode>):
   on | off | status | stop | engine edge|piper | language en|de | test [TEXT] | setup
@@ -195,21 +195,45 @@ def find_uv() -> str:
     return ""
 
 
+PREFERRED_PYTHONS = ("3.13", "3.12", "3.11", "3.10", "3.14")
+
+
 def venv_pythons() -> list:
-    """Pythons to build the voice environment with when uv isn't there, best first. Prefer a
-    recent one: macOS's built-in python3 is 3.9, which only gets older onnxruntime builds for
-    the offline voice. The running Python comes last as the fallback, since a found pythonX.Y
-    may not be able to make a venv (Debian's missing pythonX.Y-venv, a pyenv shim)."""
-    found = [shutil.which(f"python{v}") for v in ("3.13", "3.12", "3.11", "3.10")]
-    return [p for p in found if p] + [sys.executable]
+    """Pythons to build the voice environment with when uv isn't there, best first.
+
+    The offline voice needs onnxruntime, whose builds trail new Python releases (none for
+    3.15 yet), so a well-supported version comes before the running Python. macOS's
+    built-in python3 is 3.9, which gets only older onnxruntime builds. On Windows the
+    versions are found through the py launcher, since there are no pythonX.Y commands."""
+    found = []
+    for v in PREFERRED_PYTHONS:
+        exe = shutil.which(f"python{v}")
+        if not exe and WINDOWS and shutil.which("py"):
+            r = subprocess.run(["py", f"-{v}", "-c", "import sys; print(sys.executable)"],
+                               capture_output=True, text=True)
+            exe = r.stdout.strip() if r.returncode == 0 else None
+        if exe:
+            found.append(exe)
+    found.append(sys.executable)
+    return list(dict.fromkeys(found))  # each once, in order
 
 
-def make_venv() -> None:
-    """Create VENV with the first Python from venv_pythons() that manages it."""
+def build_venv_with_pip(stamp) -> None:
+    """Build VENV and install the voices with the first Python that manages both. One may
+    fail to make a venv (Debian's missing pythonX.Y-venv, a pyenv shim) or have no
+    onnxruntime build for the offline voice; then the next one gets its turn."""
+    tried = []
     for py in venv_pythons():
-        if subprocess.run([py, "-m", "venv", "--clear", str(VENV)]).returncode == 0:
+        tried.append(py)
+        if subprocess.run([py, "-m", "venv", "--clear", str(VENV)]).returncode != 0:
+            stamp(f"{py} can't make the voice environment; trying another Python")
+            continue
+        if subprocess.run([str(VENV_PY), "-m", "pip", "install", "-q", "--upgrade",
+                           "pip", "edge-tts", "piper-tts"]).returncode == 0:
             return
-    raise RuntimeError("no Python could create the voice environment (is python3-venv installed?)")
+        stamp(f"the voices don't install on {py}; trying another Python")
+    raise RuntimeError(f"no Python here can build the voices (tried {', '.join(tried)}). "
+                       "Install uv, or Python 3.12 or 3.13.")
 
 
 def ensure_setup() -> bool:
@@ -251,9 +275,7 @@ def run_setup() -> int:
                 subprocess.run([uv, "pip", "install", "-q", "--python", str(VENV_PY), "--upgrade",
                                 "edge-tts", "piper-tts"], check=True)
             else:
-                make_venv()
-                subprocess.run([str(VENV_PY), "-m", "pip", "install", "-q", "--upgrade",
-                                "pip", "edge-tts", "piper-tts"], check=True)
+                build_venv_with_pip(stamp)
             for old in VENV.glob(".tldr-voice-ready-*"):
                 old.unlink()
             READY.touch()
@@ -527,7 +549,8 @@ def main() -> int:
         sys.stdout.reconfigure(encoding="utf-8")  # UTF-8 like everywhere else, not the code page
     STATE.mkdir(parents=True, exist_ok=True)
     mode = sys.argv[1] if len(sys.argv) > 1 else ""
-    if mode not in ("session", "prompt", "display", "stop"):
+    # "stop" is the voice command (/tldr-voice:voice stop); the Stop hook is "reply-end".
+    if mode not in ("session", "prompt", "display", "reply-end"):
         return control(mode, sys.argv[2:])
 
     if os.environ.get("CLAUDE_PLUGIN_DATA"):
@@ -562,7 +585,7 @@ def main() -> int:
         if int(data.get("index", 99)) > 2:   # only the first lines of a message
             return 0
         text = data.get("delta") or ""
-    else:  # stop
+    else:  # reply-end
         text = data.get("last_assistant_message") or ""
 
     tldr = extract_tldr(text)
