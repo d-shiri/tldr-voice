@@ -14,18 +14,42 @@ Uses only the Python standard library, so hooks start fast. The voices (edge-tts
 live in their own environment in the plugin's data folder, built on first use.
 Only interactive sessions speak; headless and scheduled `claude -p` runs stay silent.
 """
-import io
 import json
 import os
 import re
-import shutil
-import signal
-import socket
-import subprocess
 import sys
-import time
-import urllib.request
-from pathlib import Path
+
+
+def read_hook_input() -> dict:
+    try:  # bytes, so json decodes UTF-8 whatever the system's code page
+        data = json.loads(sys.stdin.buffer.read() or b"{}")
+    except ValueError:
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+HOOK_INPUT: "dict | None" = None
+if __name__ == "__main__" and sys.argv[1:] == ["display"]:
+    # MessageDisplay runs this for every batch of lines Claude prints, and almost none of
+    # them can hold the TL;DR: only the first batches of a message count, and not those a
+    # subagent prints. Leave here, before the imports below, which take longer than this.
+    HOOK_INPUT = read_hook_input()
+    try:
+        late = int(HOOK_INPUT.get("index", 99)) > 2
+    except (TypeError, ValueError):
+        late = True
+    if (late or HOOK_INPUT.get("agent_id")
+            or not re.search(r"tl;?dr", str(HOOK_INPUT.get("delta") or ""), re.IGNORECASE)):
+        sys.exit(0)
+
+import hashlib  # noqa: E402
+import io  # noqa: E402
+import shutil  # noqa: E402
+import signal  # noqa: E402
+import socket  # noqa: E402
+import subprocess  # noqa: E402
+import time  # noqa: E402
+from pathlib import Path  # noqa: E402
 
 MACOS = sys.platform == "darwin"
 WINDOWS = os.name == "nt"
@@ -68,20 +92,25 @@ SETUP_VERSION = "2"                      # bump to rebuild the environment on up
 READY = VENV / f".tldr-voice-ready-{SETUP_VERSION}"
 SETUP_LOCK = DATA / "setup.lock"
 SETUP_LOG = STATE / "setup.log"
+SETUP_FAILED = STATE / "setup.failed"    # left by a failed setup; its age paces the retries
+RETRY_SETUP_AFTER = 600                  # seconds
 
 DAEMON = CODE / "edge_daemon.py"
 # Unix socket paths are capped at ~104 chars, so prefer the short runtime dir.
 # The number changes when the helper's protocol does, so an old helper is never reused.
-SOCK = (Path(os.environ["XDG_RUNTIME_DIR"]) / "tldr-voice-2.sock"
-        if os.environ.get("XDG_RUNTIME_DIR") else STATE / "edge-2.sock")
+SOCK = (Path(os.environ["XDG_RUNTIME_DIR"]) / "tldr-voice-3.sock"
+        if os.environ.get("XDG_RUNTIME_DIR") else STATE / "edge-3.sock")
 # With TCP the helper writes "<port> <key>" here; a command without the key is ignored,
 # so only someone who can read this user's state folder can make it speak.
-PORT_FILE = STATE / "edge-2.port"
+PORT_FILE = STATE / "edge-3.port"
+OWNER_FILE = STATE / "edge-3.owner"     # Unix socket: which helper the socket belongs to
+STARTING = STATE / "helper.starting"    # a hook is starting the helper right now
 OFF_FLAG = STATE / "disabled"
 ENGINE_FILE = STATE / "engine"          # "edge" (default) or "piper"
 LANGUAGE_FILE = STATE / "language"      # "en" or "de"; overrides the install-time choice
 PID_FILE = STATE / "speaking.pid"       # process group of local (Piper) playback
-LAST_FILE = STATE / "last_spoken.txt"   # avoids speaking the same TL;DR twice
+LAST_FILE = STATE / "last_spoken.txt"   # the line spoken last
+SPOKEN_DIR = STATE / "spoken"           # one file per line spoken since the last prompt
 
 # Linux can play the offline voice without mpv (paplay or aplay); macOS and Windows can't.
 if MACOS:
@@ -130,14 +159,21 @@ def utf8_env() -> dict:
 PIPER_BASE = "https://huggingface.co/rhasspy/piper-voices/resolve/v1.0.0/"
 LANGUAGES = {
     # code: (Edge voice, Piper voice path under PIPER_BASE)
-    "en": ("en-US-AvaMultilingualNeural", "en/en_US/lessac/medium/en_US-lessac-medium"),
-    "de": ("en-US-AvaMultilingualNeural", "de/de_DE/thorsten/medium/de_DE-thorsten-medium"),
+    # The Edge voices here start a new sentence in well under a second. The Multilingual
+    # English ones (Ava, Emma) sound a little richer but take 3 to 6 seconds.
+    "en": ("en-US-AvaNeural", "en/en_US/lessac/medium/en_US-lessac-medium"),
+    "de": ("de-DE-SeraphinaMultilingualNeural", "de/de_DE/thorsten/medium/de_DE-thorsten-medium"),
 }
+EDGE_TIMEOUT = 3.0  # seconds without audio from the online voice before Piper speaks instead
 
 RULES = ("Start your final reply (the message after any tool work) with one line "
          "'TL;DR: <one or two short, plain sentences>' as its very first line. It is read aloud, "
          "so no markdown, code, file paths, URLs or symbols: say what happened or what you need "
          "from the user, and if the reply asks a question, ask it there too. "
+         # The service starts speaking once it has the first sentence: ~0.6 s for a short
+         # one, ~1.1 s for twenty words.
+         "Keep its first sentence short, about ten words at most, and put details in the "
+         "second: the voice starts sooner on a short opening sentence. "
          "No TL;DR line in short progress notes between tool calls.")
 REMINDER = {
     "en": "tldr-voice is on. " + RULES,
@@ -175,6 +211,13 @@ def edge_voice() -> str:
     return os.environ.get("TLDR_VOICE_EDGE_VOICE") or LANGUAGES[language()][0]
 
 
+def edge_timeout() -> float:
+    try:
+        return float(os.environ.get("TLDR_VOICE_EDGE_TIMEOUT") or EDGE_TIMEOUT)
+    except ValueError:
+        return EDGE_TIMEOUT
+
+
 def piper_model() -> Path:
     custom = os.environ.get("TLDR_VOICE_PIPER_MODEL")
     if custom:
@@ -184,8 +227,20 @@ def piper_model() -> Path:
 
 # ---------- setup (runs in the background on first use) ----------
 
+def online_ready() -> bool:
+    """The voice environment is built: the online voice can speak."""
+    return READY.exists() and VENV_PY.exists()
+
+
+def offline_ready() -> bool:
+    return online_ready() and PIPER.exists() and piper_model().exists()
+
+
 def ready() -> bool:
-    return READY.exists() and VENV_PY.exists() and piper_model().exists()
+    """Nothing left for setup to do. A model named in TLDR_VOICE_PIPER_MODEL is the user's
+    to provide, so setup doesn't wait for it."""
+    return online_ready() and (bool(os.environ.get("TLDR_VOICE_PIPER_MODEL"))
+                               or piper_model().exists())
 
 
 def find_uv() -> str:
@@ -236,25 +291,33 @@ def build_venv_with_pip(stamp) -> None:
                        "Install uv, or Python 3.12 or 3.13.")
 
 
+def age(path: Path) -> float:
+    """Seconds since the file was written; endless if it isn't there."""
+    try:
+        return time.time() - path.stat().st_mtime
+    except OSError:
+        return float("inf")
+
+
 def ensure_setup() -> bool:
-    """True when the voices are ready; otherwise start setting them up in the background."""
+    """True when a voice can speak. Whatever is still missing gets set up in the background:
+    the online voice works as soon as the environment is built, also when the offline
+    voice's download fails, and a failed setup is tried again only every ten minutes."""
     if ready():
         return True
-    try:
-        if SETUP_LOCK.exists() and time.time() - SETUP_LOCK.stat().st_mtime < 900:
-            return False  # already running
-    except OSError:
-        pass
+    if age(SETUP_LOCK) < 900 or age(SETUP_FAILED) < RETRY_SETUP_AFTER:
+        return online_ready()  # already running, or it failed a moment ago
     STATE.mkdir(parents=True, exist_ok=True)
     with open(SETUP_LOG, "a") as log:
         subprocess.Popen([sys.executable, str(Path(__file__).resolve()), "setup"],
                          stdin=subprocess.DEVNULL, stdout=log, stderr=log,
                          env={**os.environ, "CLAUDE_PLUGIN_DATA": str(DATA)}, **detached())
-    return False
+    return online_ready()
 
 
 def run_setup() -> int:
     """Build the private Python environment and download the offline voice. Idempotent."""
+    import urllib.request  # here, not at the top: it is slow to load and hooks never use it
     DATA.mkdir(parents=True, exist_ok=True)
     try:
         fd = os.open(SETUP_LOCK, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
@@ -291,9 +354,11 @@ def run_setup() -> int:
         if not shutil.which("mpv"):
             stamp(f"note: {mpv_missing()} {MPV_INSTALL}")
         stamp("ready")
+        SETUP_FAILED.unlink(missing_ok=True)
         return 0
     except Exception as e:  # noqa: BLE001 - reported in the log and in /tldr-voice:voice status
         stamp(f"setup failed: {e}")
+        SETUP_FAILED.touch()
         return 1
     finally:
         SETUP_LOCK.unlink(missing_ok=True)
@@ -310,11 +375,38 @@ def clean(text: str) -> str:
 
 
 def extract_tldr(message: str) -> str:
-    for line in message.splitlines():
-        m = TLDR_RE.match(line.strip())
+    """The TL;DR line, if it is among the first three lines with text in them. Further
+    down, a line that starts with TL;DR is the reply quoting one, not its own."""
+    top = [line.strip() for line in message.splitlines() if line.strip()][:3]
+    for line in top:
+        m = TLDR_RE.match(line)
         if m:
             return clean(m.group(1))
     return ""
+
+
+def claim(text: str) -> bool:
+    """True for the first caller with this line since the last prompt. The hook that sees
+    the line stream in and the one at the end of the reply can run at the same moment
+    (a one-line reply), and creating the file lets exactly one of them speak."""
+    try:
+        SPOKEN_DIR.mkdir(parents=True, exist_ok=True)
+        name = hashlib.sha256(text.encode("utf-8")).hexdigest()[:32]
+        os.close(os.open(SPOKEN_DIR / name, os.O_CREAT | os.O_EXCL | os.O_WRONLY))
+    except FileExistsError:
+        return False
+    except OSError:
+        pass  # can't keep track here: better to speak twice than not at all
+    return True
+
+
+def forget_spoken() -> None:
+    LAST_FILE.unlink(missing_ok=True)
+    try:
+        for f in SPOKEN_DIR.iterdir():
+            f.unlink(missing_ok=True)
+    except OSError:
+        pass
 
 
 def daemon_connect() -> "tuple[socket.socket, str]":
@@ -333,6 +425,30 @@ def daemon_connect() -> "tuple[socket.socket, str]":
         s.close()
         raise
     return s, ""
+
+
+def start_helper(warm_for: "str | None" = None) -> None:
+    """Start the voice helper, unless another hook did so a moment ago: two started together
+    would both listen, and only one of them can have the address. The helper removes
+    STARTING once it listens. `warm_for` is a session whose reply is coming: the caller
+    won't wait to send "warm" itself, so the helper starts out holding lines for it."""
+    for _ in range(2):
+        try:
+            os.close(os.open(STARTING, os.O_CREAT | os.O_EXCL | os.O_WRONLY))
+            break
+        except FileExistsError:
+            if age(STARTING) < 10:
+                return
+            STARTING.unlink(missing_ok=True)  # that start never got as far as listening
+        except OSError:
+            break
+    else:
+        return
+    subprocess.Popen([str(VENV_PY), "-I", str(DAEMON)]
+                     + (["--warm", warm_for] if warm_for is not None else []),
+                     stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                     stderr=subprocess.DEVNULL,
+                     env={**os.environ, "CLAUDE_PLUGIN_DATA": str(DATA)}, **detached())
 
 
 def daemon_send(msg: dict, start: bool, wait: "float | None" = None) -> bool:
@@ -362,10 +478,7 @@ def daemon_send(msg: dict, start: bool, wait: "float | None" = None) -> bool:
             if not started:  # start it before looking at the clock, so wait=0 still starts it
                 if TCP and stale:
                     PORT_FILE.unlink(missing_ok=True)  # left behind by a helper that died
-                subprocess.Popen([str(VENV_PY), "-I", str(DAEMON)],
-                                 stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-                                 stderr=subprocess.DEVNULL,
-                                 env={**os.environ, "CLAUDE_PLUGIN_DATA": str(DATA)}, **detached())
+                start_helper(msg.get("session", "") if msg.get("cmd") == "warm" else None)
                 started = True
             if time.monotonic() > deadline:
                 return False
@@ -376,7 +489,7 @@ def stop_helper() -> None:
     """Ask a running helper to exit, and give it a moment to be gone."""
     if not daemon_send({"cmd": "quit"}, start=False):
         return
-    address = PORT_FILE if TCP else SOCK
+    address = PORT_FILE if TCP else OWNER_FILE
     for _ in range(30):  # the helper removes its address as it exits
         if not address.exists():
             break
@@ -384,13 +497,18 @@ def stop_helper() -> None:
     time.sleep(0.5)  # and then the process ends, releasing its files
 
 
-def stop_audio() -> None:
-    daemon_send({"cmd": "stop"}, start=False)
+def stop_local() -> None:
+    """Stop the offline voice, when a hook started it itself (not the helper)."""
     try:
         kill_tree(int(PID_FILE.read_text().strip()))
     except (OSError, ValueError):
         pass
     PID_FILE.unlink(missing_ok=True)
+
+
+def stop_audio() -> None:
+    daemon_send({"cmd": "stop"}, start=False)
+    stop_local()
 
 
 def piper_rate(model: Path) -> str:
@@ -402,6 +520,16 @@ def piper_rate(model: Path) -> str:
 
 def piper_argv(model: Path) -> list:
     return [str(PIPER), "-m", str(model), "--output-raw"]
+
+
+def stream_player_argv() -> list:
+    """mpv playing the online voice's MP3 from stdin as it arrives. Left to find out what
+    it is playing, mpv reads about 9 kB first, which is over a second of speech and takes
+    the service a few tenths of a second to send. Told the demuxer and the format, and
+    not to probe the stream, it starts on the first bytes."""
+    return [shutil.which("mpv") or "mpv", "--no-video", "--really-quiet", "--cache=no",
+            "--demuxer=lavf", "--demuxer-lavf-format=mp3", "--demuxer-lavf-probe-info=nostreams",
+            "--audio-buffer=0.1", "-"]
 
 
 def raw_player_argv(rate: str) -> list:
@@ -451,17 +579,19 @@ def mic_stop_enabled() -> bool:
     return os.environ.get("TLDR_VOICE_MIC_STOP", "1") != "0" and bool(shutil.which("pactl"))
 
 
-def speak(text: str) -> None:
+def speak(text: str, session: str = "") -> None:
     if not text or not ensure_setup():
         return
-    stop_audio()
     LAST_FILE.write_text(text, encoding="utf-8")
+    stop_local()
     msg = {"cmd": "speak", "text": text, "voice": edge_voice(), "piper_model": str(piper_model()),
-           "mic_stop": mic_stop_enabled()}
-    # Edge voice: the warm helper streams audio as it arrives and falls back to Piper itself.
+           "mic_stop": mic_stop_enabled(), "timeout": edge_timeout(), "session": session}
+    # Edge voice: the helper stops what it was saying, streams the audio as it arrives and
+    # falls back to Piper itself.
     if engine() == "edge" and shutil.which("mpv") and daemon_send(msg, start=True):
         return
-    if not PIPER.exists():
+    daemon_send({"cmd": "stop"}, start=False)
+    if not offline_ready():
         return
     if WINDOWS:
         # No shell pipeline here: a detached copy of this script joins Piper to mpv.
@@ -497,6 +627,8 @@ def status() -> str:
         setup = "ready"
     elif SETUP_LOCK.exists():
         setup = "setting up (about a minute)"
+    elif online_ready():
+        setup = f"online voice ready, offline voice missing, see {SETUP_LOG}"
     else:
         setup = f"not ready, see {SETUP_LOG}"
     lines = [f"tldr-voice: {'off' if OFF_FLAG.exists() else 'on'} | language: {language()} | "
@@ -531,7 +663,8 @@ def control(mode: str, args: list) -> int:
     if mode in ("stop", "stop-audio"):
         stop_audio(); print("tldr-voice: stopped"); return 0
     if mode in ("test", "say"):
-        if not ensure_setup():
+        ensure_setup()
+        if not (online_ready() if engine() == "edge" else offline_ready()):
             print("tldr-voice is still setting up its voices (about a minute). Try again shortly.")
             return 0
         speak(" ".join(args) or TEST_LINE[language()]); print("tldr-voice: speaking"); return 0
@@ -559,38 +692,34 @@ def main() -> int:
                 DATA_POINTER.write_text(str(DATA), encoding="utf-8")
         except OSError:
             pass
-    try:  # bytes, so json decodes UTF-8 whatever the system's code page
-        data = json.loads(sys.stdin.buffer.read() or b"{}")
-    except ValueError:
-        data = {}
+    data = HOOK_INPUT if HOOK_INPUT is not None else read_hook_input()
+    session = str(data.get("session_id") or "")
 
     if mode == "session":
         ensure_setup()
         return 0  # SessionStart stdout would go into Claude's context, so print nothing
 
     if mode == "prompt":
-        stop_audio()
-        LAST_FILE.unlink(missing_ok=True)
         if interactive() and not OFF_FLAG.exists():
             print(REMINDER[language()], flush=True)  # first: this hook has only 5 s
-            if engine() == "edge" and ready():
-                # Warm up while Claude works; a helper that isn't up yet starts without waiting.
-                daemon_send({"cmd": "warm", "voice": edge_voice()}, start=True, wait=0)
+        stop_audio()
+        forget_spoken()
+        if interactive() and not OFF_FLAG.exists() and engine() == "edge" and online_ready():
+            # The helper holds a connection open while Claude works, so the line can go
+            # out the moment it appears; a helper that isn't up yet starts without waiting.
+            daemon_send({"cmd": "warm", "session": session}, start=True, wait=0)
         return 0
 
-    if not interactive() or OFF_FLAG.exists():
-        return 0
+    if not interactive() or OFF_FLAG.exists() or data.get("agent_id"):
+        return 0  # agent_id: a subagent's message, not the reply to the user
 
-    if mode == "display":
-        if int(data.get("index", 99)) > 2:   # only the first lines of a message
-            return 0
-        text = data.get("delta") or ""
-    else:  # reply-end
-        text = data.get("last_assistant_message") or ""
-
-    tldr = extract_tldr(text)
-    if tldr and tldr != read(LAST_FILE):
-        speak(tldr)
+    # display: the batches past a message's first lines never get here (see the top).
+    text = data.get("delta" if mode == "display" else "last_assistant_message") or ""
+    tldr = extract_tldr(str(text))
+    if tldr and claim(tldr):
+        speak(tldr, session)
+    elif mode == "reply-end" and not tldr:
+        daemon_send({"cmd": "rest", "session": session}, start=False)  # nothing to say
     return 0
 
 

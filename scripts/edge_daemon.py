@@ -2,16 +2,20 @@
 
 Listens on a Unix socket (on Windows: a local TCP port, with a key) for one-line JSON
 commands from speak.py:
-  {"cmd": "speak", "text": "...", "voice": "...", "piper_model": "...", "mic_stop": true}
-                                   stream audio straight into mpv (latest wins)
-  {"cmd": "stop"}                  silence current speech
-  {"cmd": "warm", "voice": "..."}  tiny throwaway request so the next one is fast
-  {"cmd": "quit"}                  stop and exit (setup is rebuilding the environment)
+  {"cmd": "speak", "text": "...", "voice": "...", "piper_model": "...", "mic_stop": true,
+   "timeout": 3, "session": "..."}  stream audio straight into mpv (latest wins)
+  {"cmd": "stop"}                   silence current speech
+  {"cmd": "warm", "session": "..."} a reply is coming: hold connections open for it
+  {"cmd": "rest", "session": "..."} that reply ended without a line to speak
+  {"cmd": "quit"}                   stop and exit (setup is rebuilding the environment)
 
-Identical requests race and the first to answer is played; while none has answered,
-a fresh one joins every HEDGE_EVERY seconds. This cuts the slow tail of the free
-service. If no audio arrives within FIRST_AUDIO_TIMEOUT seconds, or every request
-fails, the local Piper voice speaks instead. Exits after 30 min idle.
+Opening a connection to the service takes about half a second, so between a prompt
+and its reply the helper holds RACERS of them open (see keep_lines) and the sentence
+goes out on them at once. Identical requests race and the first to answer is played;
+while none has answered, a fresh one joins every HEDGE_EVERY seconds. This cuts the slow tail of the
+free service. If no audio arrives within the timeout, or every request fails, the
+local Piper voice speaks instead. Exits after 30 min idle, or when a newer helper has
+taken its place.
 """
 import asyncio
 import json
@@ -24,22 +28,42 @@ from pathlib import Path
 
 import edge_tts
 
+try:
+    # What a held-open connection needs from inside edge-tts. A release that moves any
+    # of it leaves LINES off, and every sentence goes through edge-tts's own interface.
+    from xml.sax.saxutils import escape
+
+    import aiohttp
+    from edge_tts import communicate as _edge
+    from edge_tts.constants import SEC_MS_GEC_VERSION, WSS_HEADERS, WSS_URL
+    from edge_tts.data_classes import TTSConfig
+    from edge_tts.drm import DRM
+    _ = (_edge.connect_id, _edge.date_to_string, _edge.mkssml, _edge.ssml_headers_plus_data,
+         _edge.remove_incompatible_characters, _edge._SSL_CTX,
+         DRM.generate_sec_ms_gec, DRM.headers_with_muid, DRM.handle_client_response_error)
+    LINES = True
+except Exception:  # noqa: BLE001
+    LINES = False
+
 sys.path.insert(0, str(Path(__file__).resolve().parent))  # -I leaves the script dir out
 import speak as cfg  # noqa: E402 - shared paths and the Piper pipeline
 
 STATE, SOCK, PIPER = cfg.STATE, cfg.SOCK, cfg.PIPER
 LOG = STATE / "edge.log"
-DEFAULT_VOICE = "en-US-AvaMultilingualNeural"
+DEFAULT_VOICE = cfg.LANGUAGES["en"][0]
 IDLE_EXIT = 30 * 60
 RACERS = 2                 # identical requests started at once; first to answer is played
 HEDGE_EVERY = 1.2          # no audio yet -> start one more fresh request this often
 MAX_RACERS = 6             # cap on requests per sentence (failed ones are replaced too)
-FIRST_AUDIO_TIMEOUT = 8.0  # seconds without audio -> local Piper voice instead
+STALL_TIMEOUT = 15.0       # the playing request goes quiet for this long -> give up on it
+KEEP_WARM = 20 * 60        # hold connections open this long for a reply that hasn't come
+KEEP_ALIVE_EVERY = 15.0    # the service drops a connection that is silent for ~30 s
 
 current: "asyncio.Task | None" = None
 procs: set = set()
 last_used = 0.0
 quitting: "asyncio.Event | None" = None  # made in main(): an Event belongs to its loop
+commands: "asyncio.Lock | None" = None   # made in main() too: one command at a time
 KEY = secrets.token_hex(16) if cfg.TCP else ""  # TCP only: commands must carry it
 
 
@@ -152,10 +176,11 @@ async def mic_opened(enabled: bool) -> bool:
         await p.wait()
 
 
-async def speak_until_mic(msg: dict) -> None:
-    """Speak, but stop the moment the microphone opens: you want to talk, so Ava stops."""
+async def speak_until_mic(msg: dict, lines: list) -> None:
+    """Speak, but stop the moment the microphone opens: you want to talk, so the voice stops."""
     speech = asyncio.create_task(speak(msg["text"], msg.get("voice") or DEFAULT_VOICE,
-                                       Path(msg.get("piper_model") or "")))
+                                       Path(msg.get("piper_model") or ""),
+                                       first_audio_timeout(msg), lines))
     watch = asyncio.create_task(mic_opened(bool(msg.get("mic_stop", True))))
     try:
         await asyncio.wait({speech, watch}, return_when=asyncio.FIRST_COMPLETED)
@@ -169,19 +194,192 @@ async def speak_until_mic(msg: dict) -> None:
         watch.cancel()
 
 
-async def race_streams(text: str, voice: str):
+# ---------- connections held open for the next sentence ----------
+
+class Line:
+    """One open connection to the speech service, good for one sentence."""
+
+    def __init__(self, session, ws) -> None:
+        self.session, self.ws = session, ws
+
+    async def close(self) -> None:
+        for part in (self.ws, self.session):
+            try:  # the goodbye waits for the service's answer, which a dead network never sends
+                await asyncio.wait_for(part.close(), 2)
+            except Exception:  # noqa: BLE001 - it's going away either way
+                pass
+
+
+closing: set = set()
+
+
+def let_go(line: Line) -> None:
+    """Close a line in the background, so no sentence waits for the goodbye. Letting the
+    same line go twice does no harm."""
+    task = asyncio.ensure_future(line.close())
+    closing.add(task)  # asyncio itself keeps only a weak reference to a running task
+    task.add_done_callback(closing.discard)
+
+
+def config_message() -> str:
+    """The settings message every sentence starts with. Sending it again later is also
+    what keeps an idle connection open: websocket pings don't."""
+    return (f"X-Timestamp:{_edge.date_to_string()}\r\n"
+            "Content-Type:application/json; charset=utf-8\r\n"
+            "Path:speech.config\r\n\r\n"
+            '{"context":{"synthesis":{"audio":{"metadataoptions":{'
+            '"sentenceBoundaryEnabled":"false","wordBoundaryEnabled":"false"},'
+            '"outputFormat":"audio-24khz-48kbitrate-mono-mp3"}}}}\r\n')
+
+
+async def open_line() -> Line:
+    session = aiohttp.ClientSession(
+        trust_env=True, timeout=aiohttp.ClientTimeout(total=None, sock_connect=10))
+    try:
+        for attempt in (1, 2):
+            try:
+                ws = await session.ws_connect(
+                    f"{WSS_URL}&ConnectionId={_edge.connect_id()}"
+                    f"&Sec-MS-GEC={DRM.generate_sec_ms_gec()}"
+                    f"&Sec-MS-GEC-Version={SEC_MS_GEC_VERSION}",
+                    compress=15, headers=DRM.headers_with_muid(WSS_HEADERS), ssl=_edge._SSL_CTX)
+                return Line(session, ws)
+            except aiohttp.ClientResponseError as e:
+                if e.status != 403 or attempt == 2:
+                    raise
+                DRM.handle_client_response_error(e)  # this clock is off: adjust, try again
+    except BaseException:
+        await session.close()
+        raise
+    raise AssertionError("unreachable")
+
+
+async def line_audio(line: Line, text: str, voice: str):
+    """Yield the audio for one sentence sent over an open line."""
+    tts = TTSConfig(voice, "+0%", "+0%", "+0Hz", "SentenceBoundary")
+    ssml = _edge.mkssml(tts, escape(_edge.remove_incompatible_characters(text)))
+    await line.ws.send_str(config_message())
+    await line.ws.send_str(
+        _edge.ssml_headers_plus_data(_edge.connect_id(), _edge.date_to_string(), ssml))
+    got_audio = False
+    async for m in line.ws:
+        if m.type == aiohttp.WSMsgType.TEXT:
+            if "Path:turn.end" in m.data.split("\r\n\r\n", 1)[0]:
+                break
+        elif m.type == aiohttp.WSMsgType.BINARY:
+            data = m.data[int.from_bytes(m.data[:2], "big") + 2:]  # after the header block
+            if data:
+                got_audio = True
+                yield data
+        else:
+            raise ConnectionError("the line broke")
+    if not got_audio:  # also how a line the service closed while it waited shows up
+        raise ConnectionError("no audio on the open line")
+
+
+warm_until: dict = {}  # session -> when to stop holding lines open for its reply
+kept: list = []        # open lines, waiting for the next sentence
+wake: "asyncio.Event | None" = None  # made in main(); set when who wants lines has changed
+
+
+def wanted() -> bool:
+    now = asyncio.get_running_loop().time()
+    for session in [s for s, until in warm_until.items() if until <= now]:
+        del warm_until[session]
+    return bool(warm_until)
+
+
+async def keep_lines() -> None:
+    """While some session waits for its reply, hold open one line for each request the
+    sentence will start with. Runs for as long as the helper does."""
+    assert wake is not None
+    loop = asyncio.get_running_loop()
+    next_sign_of_life = 0.0
+    try:
+        while True:
+            if not wanted():
+                for line in take_lines():
+                    let_go(line)
+                await wake.wait()  # until a prompt says a reply is coming
+                wake.clear()
+                continue
+            opened = await asyncio.gather(*[open_line() for _ in range(RACERS - len(kept))],
+                                          return_exceptions=True)
+            for line in opened:
+                if isinstance(line, Line):
+                    kept.append(line)
+                elif isinstance(line, Exception):  # offline, or the service says no
+                    log(f"couldn't open a line ahead of the reply ({type(line).__name__})")
+                else:
+                    raise line  # cancelled
+            try:
+                await asyncio.wait_for(wake.wait(), max(0.0, next_sign_of_life - loop.time()))
+            except asyncio.TimeoutError:
+                pass
+            wake.clear()
+            if loop.time() >= next_sign_of_life:
+                next_sign_of_life = loop.time() + KEEP_ALIVE_EVERY
+                for line in list(kept):
+                    try:
+                        await line.ws.send_str(config_message())
+                    except Exception:  # noqa: BLE001 - the service closed it: open another
+                        if line in kept:  # not if a sentence took it meanwhile
+                            kept.remove(line)
+                            let_go(line)
+    finally:
+        for line in take_lines():
+            let_go(line)
+
+
+def keep_warm(session: str) -> None:
+    if LINES and wake is not None:
+        warm_until[session] = asyncio.get_running_loop().time() + KEEP_WARM
+        wake.set()
+
+
+def take_lines() -> list:
+    """The held lines. They belong to the caller now, who closes them."""
+    lines = kept[:]
+    kept.clear()
+    return lines
+
+
+async def race_streams(text: str, voice: str, timeout: float, lines: list, t0: float):
     """Yield audio chunks from whichever identical request answers first.
 
-    The free service has a slow tail: most requests answer in ~0.6 s, some take 3-6 s.
-    Starting RACERS at once and adding a fresh one every HEDGE_EVERY seconds (and right
-    away when one fails) keeps the Ava voice instead of falling back to Piper.
+    The free service has a slow tail: how long a new sentence takes depends on the voice
+    (well under a second for most, several for the Multilingual ones) and now and then
+    one takes far longer. Starting RACERS at once and adding a fresh one every HEDGE_EVERY
+    seconds (and right away when one fails) keeps the online voice instead of falling
+    back to Piper. The first requests go out on `lines`, the connections held open for
+    this sentence; with none left, a request opens its own, which takes about half a
+    second more. No audio within `timeout` seconds raises.
+
+    The service starts sending once it has the line's first sentence, so the wait grows
+    with that sentence's length, not the line's. Asking for the first sentence on its own
+    was tried and measured: it starts no sooner.
     """
     queue: asyncio.Queue = asyncio.Queue()
     loop = asyncio.get_running_loop()
-    deadline = loop.time() + FIRST_AUDIO_TIMEOUT
+    deadline = loop.time() + timeout
 
     async def run(k: int) -> None:
         try:
+            if k < len(lines):
+                line, got_audio = lines[k], False
+                try:
+                    async for data in line_audio(line, text, voice):
+                        got_audio = True
+                        await queue.put((k, data))
+                except Exception as e:  # noqa: BLE001
+                    if got_audio:
+                        raise
+                    log(f"the open line gave no audio ({type(e).__name__}); asking again")
+                finally:
+                    let_go(line)
+                if got_audio:
+                    await queue.put((k, None))  # finished
+                    return
             async for chunk in edge_tts.Communicate(text, voice).stream():
                 if chunk["type"] == "audio":
                     await queue.put((k, chunk["data"]))
@@ -218,7 +416,7 @@ async def race_streams(text: str, voice: str):
                             next_hedge = deadline
                     continue
             else:
-                k, item = await queue.get()
+                k, item = await asyncio.wait_for(queue.get(), STALL_TIMEOUT)
             if winner is None:
                 if item is None or isinstance(item, Exception):
                     dead += 1
@@ -232,6 +430,8 @@ async def race_streams(text: str, voice: str):
                 winner = k
                 if len(tasks) > RACERS:
                     log(f"answered by request {k + 1} of {len(tasks)}")
+                log(f"first audio after {loop.time() - t0:.2f}s"
+                    + (" on an open line" if k < len(lines) else ""))
                 for j, t in enumerate(tasks):
                     if j != k:
                         t.cancel()
@@ -247,20 +447,18 @@ async def race_streams(text: str, voice: str):
             t.cancel()
 
 
-async def speak(text: str, voice: str, piper_model: Path) -> None:
+async def speak(text: str, voice: str, piper_model: Path, timeout: float, lines: list) -> None:
+    """Say one sentence. `lines` are the connections that were held open for it."""
     t0 = asyncio.get_running_loop().time()
-    # Start the player and the request together; feed audio in as it streams.
-    player = await spawn(
-        shutil.which("mpv") or "mpv", "--no-video", "--really-quiet", "--cache=no",
-        "--demuxer-lavf-format=mp3", "--audio-buffer=0.1", "-",
-        stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.DEVNULL,
-        stderr=asyncio.subprocess.DEVNULL, **cfg.detached())
-    assert player.stdin is not None
+    player = None
     got_audio = False
     try:
-        async for data in race_streams(text, voice):
-            if not got_audio:
-                log(f"first audio after {asyncio.get_running_loop().time() - t0:.2f}s")
+        # Start the player and the request together; feed audio in as it streams.
+        player = await spawn(
+            *cfg.stream_player_argv(), stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL, **cfg.detached())
+        assert player.stdin is not None
+        async for data in race_streams(text, voice, timeout, lines, t0):
             got_audio = True
             player.stdin.write(data)
             await player.stdin.drain()
@@ -275,14 +473,15 @@ async def speak(text: str, voice: str, piper_model: Path) -> None:
             await piper_fallback(text, piper_model)
     finally:
         procs.discard(player)
+        for line in lines:
+            let_go(line)  # however this ended
 
 
-async def warm(voice: str) -> None:
+def first_audio_timeout(msg: dict) -> float:
     try:
-        async for _ in edge_tts.Communicate("Hi.", voice).stream():
-            pass
-    except Exception:  # noqa: BLE001 - warming is best effort
-        pass
+        return min(30.0, max(1.0, float(msg.get("timeout") or cfg.EDGE_TIMEOUT)))
+    except (TypeError, ValueError):
+        return cfg.EDGE_TIMEOUT
 
 
 async def stop_current() -> None:
@@ -309,50 +508,83 @@ async def handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> 
     if KEY and not secrets.compare_digest(str(msg.get("key", "")), KEY):
         writer.close()  # not from speak.py: another program found the port
         return
-    cmd = msg.get("cmd")
-    if cmd == "speak" and msg.get("text"):
-        await stop_current()
-        current = asyncio.create_task(speak_until_mic(msg))
-    elif cmd in ("stop", "quit"):
-        await stop_current()
-        if cmd == "quit" and quitting:  # setup is about to rebuild the venv we run from
-            quitting.set()
-    elif cmd == "warm" and not (current and not current.done()):
-        asyncio.create_task(warm(msg.get("voice") or DEFAULT_VOICE))
+    cmd, session = msg.get("cmd"), str(msg.get("session") or "")
+    assert commands is not None and wake is not None
+    async with commands:  # one at a time: two sentences arriving together would both play
+        if cmd == "speak" and msg.get("text"):
+            warm_until.pop(session, None)  # this is the reply the lines were held for
+            lines = take_lines()  # now, before the keeper sees they're no longer wanted
+            wake.set()  # another session may still be waiting: open new ones for it
+            await stop_current()
+            current = asyncio.create_task(speak_until_mic(msg, lines))
+        elif cmd in ("stop", "quit"):
+            await stop_current()
+            if cmd == "quit" and quitting:  # setup is about to rebuild the venv we run from
+                quitting.set()
+        elif cmd == "warm":
+            keep_warm(session)
+        elif cmd == "rest":
+            warm_until.pop(session, None)
+            wake.set()
     writer.write(b"ok\n")
     await writer.drain()
     writer.close()
 
 
+def register(registered: Path, mine: str) -> None:
+    tmp = registered.with_suffix(f".{os.getpid()}.tmp")
+    tmp.write_text(mine, encoding="utf-8")
+    tmp.replace(registered)  # written whole, only once the address is listening
+
+
 async def main() -> None:
-    global last_used, quitting
-    quitting = asyncio.Event()
+    global last_used, quitting, commands, wake
+    quitting, commands, wake = asyncio.Event(), asyncio.Lock(), asyncio.Event()
     STATE.mkdir(parents=True, exist_ok=True)
-    mine = ""
+    # Whoever's name is in `registered` is the helper speak.py talks to. Two can start at
+    # the same moment; the later one takes the address, and the earlier one sees its name
+    # gone, leaves, and touches nothing on the way out.
     if cfg.TCP:
         server = await asyncio.start_server(handle, "127.0.0.1", 0)
         port = server.sockets[0].getsockname()[1]
-        mine = f"{port} {KEY}"
-        tmp = cfg.PORT_FILE.with_suffix(f".{os.getpid()}.tmp")  # helpers started together
-        tmp.write_text(mine, encoding="utf-8")
-        tmp.replace(cfg.PORT_FILE)  # written whole, only once the port is listening
+        registered, mine = cfg.PORT_FILE, f"{port} {KEY}"
+        register(registered, mine)
     else:
-        SOCK.unlink(missing_ok=True)
-        server = await asyncio.start_unix_server(handle, path=str(SOCK))
-        os.chmod(SOCK, 0o600)
+        import fcntl  # not on Windows, which takes the branch above
+        registered, mine = cfg.OWNER_FILE, f"{os.getpid()} {secrets.token_hex(8)}"
+        with open(STATE / "helper.lock", "w") as lock:
+            # Taking the socket and writing the name must not interleave with another
+            # helper doing the same, or the name and the socket end up with different ones.
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            SOCK.unlink(missing_ok=True)
+            server = await asyncio.start_unix_server(handle, path=str(SOCK))
+            os.chmod(SOCK, 0o600)
+            register(registered, mine)
+    cfg.STARTING.unlink(missing_ok=True)
+    keeper = asyncio.create_task(keep_lines()) if LINES else None
+    if sys.argv[1:2] == ["--warm"]:  # started by a prompt: its reply is on the way
+        keep_warm(sys.argv[2] if len(sys.argv) > 2 else "")
+
+    def still_mine() -> bool:
+        return cfg.read(registered) == mine
+
     loop = asyncio.get_running_loop()
     last_used = loop.time()
     async with server:
-        while loop.time() - last_used < IDLE_EXIT and not quitting.is_set():
+        while loop.time() - last_used < IDLE_EXIT and not quitting.is_set() and still_mine():
             try:
-                await asyncio.wait_for(quitting.wait(), 30)
+                await asyncio.wait_for(quitting.wait(), 2)
             except asyncio.TimeoutError:
                 pass
-    if cfg.TCP:
-        if cfg.read(cfg.PORT_FILE) == mine:  # a newer helper may have taken over
-            cfg.PORT_FILE.unlink(missing_ok=True)
+    if keeper is not None:
+        keeper.cancel()
+        await asyncio.gather(keeper, return_exceptions=True)
+    if still_mine():
+        registered.unlink(missing_ok=True)
+        if not cfg.TCP:
+            SOCK.unlink(missing_ok=True)
     else:
-        SOCK.unlink(missing_ok=True)
+        log("a newer helper took over; this one is leaving")
 
 
 if __name__ == "__main__":

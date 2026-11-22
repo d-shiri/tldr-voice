@@ -92,7 +92,7 @@ Set these in the `env` block of `~/.claude/settings.json`:
 {
   "env": {
     "TLDR_VOICE_MIC_STOP": "0",
-    "TLDR_VOICE_EDGE_VOICE": "en-US-AvaMultilingualNeural"
+    "TLDR_VOICE_EDGE_VOICE": "en-US-AriaNeural"
   }
 }
 ```
@@ -100,10 +100,14 @@ Set these in the `env` block of `~/.claude/settings.json`:
 | Variable | Default | What it does |
 | --- | --- | --- |
 | `TLDR_VOICE_MIC_STOP` | `1` | `0` turns off the hold-space stop |
-| `TLDR_VOICE_EDGE_VOICE` | `en-US-AvaMultilingualNeural` | Picks another online voice (used for German too) |
+| `TLDR_VOICE_EDGE_VOICE` | `en-US-AvaNeural`, for German `de-DE-SeraphinaMultilingualNeural` | Picks another online voice, used for both languages |
+| `TLDR_VOICE_EDGE_TIMEOUT` | `3` | Seconds to wait for the online voice before the offline voice speaks instead |
+
+> [!TIP]
+> The default voices start speaking in under a second. The English Multilingual voices (`en-US-AvaMultilingualNeural`, `en-US-EmmaMultilingualNeural`) sound a little richer but take 3 to 6 seconds on every new sentence; if you pick one, raise `TLDR_VOICE_EDGE_TIMEOUT` to `8`.
 
 > [!NOTE]
-> **Privacy:** the online voice sends only the TL;DR line to Microsoft's speech service. `/tldr-voice:voice engine piper` keeps everything offline.
+> **Privacy:** the online voice sends only the TL;DR line to Microsoft's speech service. To start speaking sooner it opens its connection to that service when you send a prompt, before there is a line to send. `/tldr-voice:voice engine piper` keeps everything offline.
 
 ## Uninstall
 
