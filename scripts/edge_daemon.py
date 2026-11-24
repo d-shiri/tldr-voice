@@ -3,10 +3,14 @@
 Listens on a Unix socket (on Windows: a local TCP port, with a key) for one-line JSON
 commands from speak.py:
   {"cmd": "speak", "text": "...", "voice": "...", "piper_model": "...", "mic_stop": true,
-   "timeout": 3, "session": "...",
-   "intro": "...", "intro_clip": "..."}  stream audio straight into mpv (latest wins),
-                                    after the intro (optional; see load_intro)
-  {"cmd": "stop"}                   silence current speech
+   "timeout": 3, "session": "...", "rate": "+0%", "speed": 1,
+   "intro": "...", "intro_clip": "..."}  stream audio straight into mpv, after the intro
+                                    (optional; see load_intro). A newer line from the
+                                    same session replaces the one playing; one from
+                                    another session waits its turn (see handle)
+  {"cmd": "stop"}                   silence current speech and drop the waiting lines
+  {"cmd": "stop", "session": "..."} a prompt was sent there: stop that session's line,
+                                    playing or waiting; other sessions' lines go on
   {"cmd": "warm", "session": "..."} a reply is coming: hold connections open for it
   {"cmd": "rest", "session": "..."} that reply ended without a line to speak
   {"cmd": "quit"}                   stop and exit (setup is rebuilding the environment)
@@ -22,6 +26,7 @@ taken its place.
 import asyncio
 import json
 import os
+import re
 import secrets
 import shutil
 import sys
@@ -64,10 +69,14 @@ KEEP_ALIVE_EVERY = 15.0    # the service drops a connection that is silent for ~
 current: "asyncio.Task | None" = None
 procs: set = set()
 recording: set = set()   # intros being recorded for next time
+current_session = ""     # whose line is playing
+waiting: list = []       # lines from other sessions, in the order they came; one per session
+MAX_WAITING = 4          # past this the oldest waiting line is dropped
 last_used = 0.0
 quitting: "asyncio.Event | None" = None  # made in main(): an Event belongs to its loop
 commands: "asyncio.Lock | None" = None   # made in main() too: one command at a time
 KEY = secrets.token_hex(16) if cfg.TCP else ""  # TCP only: commands must carry it
+re_rate = re.compile(r"[+-]\d{1,3}%")
 
 
 def end(p) -> None:
@@ -116,14 +125,14 @@ async def spawn(*args, **kw) -> asyncio.subprocess.Process:
     return p
 
 
-async def piper_fallback(text: str, model: Path) -> None:
+async def piper_fallback(text: str, model: Path, factor: float = 1.0) -> None:
     if not PIPER.exists() or not model.exists():
         return
     if cfg.WINDOWS:
-        await piper_fallback_windows(text, model)
+        await piper_fallback_windows(text, model, factor)
         return
     p = await spawn(
-        "sh", "-c", cfg.piper_command(model), "piper", text,
+        "sh", "-c", cfg.piper_command(model, factor), "piper", text,
         stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL, start_new_session=True)
     try:
         await p.wait()  # keep speak() running while Piper talks, so the mic watch covers it
@@ -131,7 +140,7 @@ async def piper_fallback(text: str, model: Path) -> None:
         procs.discard(p)
 
 
-async def piper_fallback_windows(text: str, model: Path) -> None:
+async def piper_fallback_windows(text: str, model: Path, factor: float = 1.0) -> None:
     """Windows has no `sh`: start Piper and mpv joined by a pipe, each tracked in procs."""
     dn = asyncio.subprocess.DEVNULL
     r, w = os.pipe()
@@ -141,7 +150,7 @@ async def piper_fallback_windows(text: str, model: Path) -> None:
     finally:
         os.close(r)
     try:
-        piper = await spawn(*cfg.piper_argv(model), stdin=asyncio.subprocess.PIPE, stdout=w,
+        piper = await spawn(*cfg.piper_argv(model, factor), stdin=asyncio.subprocess.PIPE, stdout=w,
                             stderr=dn, env=cfg.utf8_env(), **cfg.detached())
     finally:
         os.close(w)
@@ -190,13 +199,13 @@ def load_intro(msg: dict) -> bytes:
         return b""
 
 
-async def record_intro(intro: str, voice: str, clip: Path) -> None:
+async def record_intro(intro: str, voice: str, clip: Path, rate: str = "+0%") -> None:
     """Record the intro once, so from then on it plays from disk without waiting for the
     service. Its audio has the same format as a line's, so the two play as one stream."""
     tmp = clip.with_suffix(f".{os.getpid()}.part")
     try:
         clip.parent.mkdir(parents=True, exist_ok=True)
-        await edge_tts.Communicate(intro, voice).save(str(tmp))
+        await edge_tts.Communicate(intro, voice, rate=rate).save(str(tmp))
         if tmp.stat().st_size > 0:
             tmp.replace(clip)
     except Exception as e:  # noqa: BLE001 - it is tried again with the next intro
@@ -207,7 +216,8 @@ async def record_intro(intro: str, voice: str, clip: Path) -> None:
 
 def record_later(msg: dict) -> None:
     task = asyncio.ensure_future(record_intro(
-        str(msg["intro"]), msg.get("voice") or DEFAULT_VOICE, Path(str(msg["intro_clip"]))))
+        str(msg["intro"]), msg.get("voice") or DEFAULT_VOICE, Path(str(msg["intro_clip"])),
+        rate_of(msg)))
     recording.add(task)  # asyncio itself keeps only a weak reference to a running task
     task.add_done_callback(recording.discard)
 
@@ -222,7 +232,8 @@ async def speak_until_mic(msg: dict, lines: list) -> None:
             record_later(msg)
     speech = asyncio.create_task(speak(text, msg.get("voice") or DEFAULT_VOICE,
                                        Path(msg.get("piper_model") or ""),
-                                       first_audio_timeout(msg), lines, intro))
+                                       first_audio_timeout(msg), lines, intro,
+                                       rate_of(msg), speed_of(msg)))
     watch = asyncio.create_task(mic_opened(bool(msg.get("mic_stop", True))))
     try:
         await asyncio.wait({speech, watch}, return_when=asyncio.FIRST_COMPLETED)
@@ -230,6 +241,9 @@ async def speak_until_mic(msg: dict, lines: list) -> None:
             log("microphone opened; speech stopped")
             speech.cancel()
             kill_procs()
+            if waiting:  # you are talking now: the other lines would talk over you
+                log(f"dropped {len(waiting)} waiting line(s)")
+                waiting.clear()
         await asyncio.gather(speech, return_exceptions=True)
     finally:
         speech.cancel()
@@ -296,9 +310,9 @@ async def open_line() -> Line:
     raise AssertionError("unreachable")
 
 
-async def line_audio(line: Line, text: str, voice: str):
+async def line_audio(line: Line, text: str, voice: str, rate: str = "+0%"):
     """Yield the audio for one sentence sent over an open line."""
-    tts = TTSConfig(voice, "+0%", "+0%", "+0Hz", "SentenceBoundary")
+    tts = TTSConfig(voice, rate, "+0%", "+0Hz", "SentenceBoundary")
     ssml = _edge.mkssml(tts, escape(_edge.remove_incompatible_characters(text)))
     await line.ws.send_str(config_message())
     await line.ws.send_str(
@@ -386,7 +400,8 @@ def take_lines() -> list:
     return lines
 
 
-async def race_streams(text: str, voice: str, timeout: float, lines: list, t0: float):
+async def race_streams(text: str, voice: str, timeout: float, lines: list, t0: float,
+                       rate: str = "+0%"):
     """Yield audio chunks from whichever identical request answers first.
 
     The free service has a slow tail: how long a new sentence takes depends on the voice
@@ -410,7 +425,7 @@ async def race_streams(text: str, voice: str, timeout: float, lines: list, t0: f
             if k < len(lines):
                 line, got_audio = lines[k], False
                 try:
-                    async for data in line_audio(line, text, voice):
+                    async for data in line_audio(line, text, voice, rate):
                         got_audio = True
                         await queue.put((k, data))
                 except Exception as e:  # noqa: BLE001
@@ -422,7 +437,7 @@ async def race_streams(text: str, voice: str, timeout: float, lines: list, t0: f
                 if got_audio:
                     await queue.put((k, None))  # finished
                     return
-            async for chunk in edge_tts.Communicate(text, voice).stream():
+            async for chunk in edge_tts.Communicate(text, voice, rate=rate).stream():
                 if chunk["type"] == "audio":
                     await queue.put((k, chunk["data"]))
             await queue.put((k, None))  # finished
@@ -490,7 +505,7 @@ async def race_streams(text: str, voice: str, timeout: float, lines: list, t0: f
 
 
 async def speak(text: str, voice: str, piper_model: Path, timeout: float, lines: list,
-                intro: bytes = b"") -> None:
+                intro: bytes = b"", rate: str = "+0%", factor: float = 1.0) -> None:
     """Say one sentence. `lines` are the connections that were held open for it. `intro` is
     recorded audio that plays first, while the service is still working on the sentence."""
     t0 = asyncio.get_running_loop().time()
@@ -505,7 +520,7 @@ async def speak(text: str, voice: str, piper_model: Path, timeout: float, lines:
         if intro:
             player.stdin.write(intro)
             await player.stdin.drain()
-        async for data in race_streams(text, voice, timeout, lines, t0):
+        async for data in race_streams(text, voice, timeout, lines, t0, rate):
             got_audio = True
             player.stdin.write(data)
             await player.stdin.drain()
@@ -517,11 +532,24 @@ async def speak(text: str, voice: str, piper_model: Path, timeout: float, lines:
         log(f"edge voice failed ({type(e).__name__}); {'Piper fallback' if not got_audio else 'stopped'}")
         kill_procs()
         if not got_audio:
-            await piper_fallback(text, piper_model)
+            await piper_fallback(text, piper_model, factor)
     finally:
         procs.discard(player)
         for line in lines:
             let_go(line)  # however this ended
+
+
+def rate_of(msg: dict) -> str:
+    """The online voice's rate the line asks for, such as "+20%"; anything else is "+0%"."""
+    rate = str(msg.get("rate") or "+0%")
+    return rate if re_rate.fullmatch(rate) else "+0%"
+
+
+def speed_of(msg: dict) -> float:
+    try:
+        return min(2.0, max(0.5, float(msg.get("speed") or 1)))
+    except (TypeError, ValueError):
+        return 1.0
 
 
 def first_audio_timeout(msg: dict) -> float:
@@ -545,8 +573,49 @@ async def stop_current() -> None:
     current = None
 
 
+def busy() -> bool:
+    return current is not None and not current.done()
+
+
+def play(msg: dict) -> None:
+    """Start speaking a line now. Call with nothing playing, holding `commands`."""
+    global current, current_session
+    assert wake is not None
+    lines = take_lines()  # now, before the keeper sees they're no longer wanted
+    wake.set()  # another session may still be waiting: open new ones for it
+    current_session = str(msg.get("session") or "")
+    current = asyncio.create_task(speak_until_mic(msg, lines))
+    current.add_done_callback(finished)
+
+
+def finished(task: asyncio.Task) -> None:
+    """A line ended. Unless it was stopped (whoever stopped it decides what comes next),
+    the next waiting line gets its turn."""
+    if not task.cancelled() and waiting:
+        task = asyncio.ensure_future(play_next())
+        recording.add(task)  # held like the recordings, so it isn't collected mid-way
+        task.add_done_callback(recording.discard)
+
+
+async def play_next() -> None:
+    assert commands is not None
+    async with commands:
+        if waiting and not busy():
+            play(waiting.pop(0))
+
+
+def wait_turn(msg: dict) -> None:
+    """Hold a line until the one playing ends. A newer line from the same session takes
+    the place of its older one: only a session's latest line is worth hearing."""
+    session = str(msg.get("session") or "")
+    waiting[:] = [m for m in waiting if str(m.get("session") or "") != session] + [msg]
+    if len(waiting) > MAX_WAITING:
+        del waiting[0]
+    log(f"line waits its turn ({len(waiting)} waiting)")
+
+
 async def handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
-    global current, last_used
+    global last_used
     last_used = asyncio.get_running_loop().time()
     try:
         msg = json.loads((await reader.readline()) or b"{}")
@@ -560,11 +629,24 @@ async def handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> 
     async with commands:  # one at a time: two sentences arriving together would both play
         if cmd == "speak" and msg.get("text"):
             warm_until.pop(session, None)  # this is the reply the lines were held for
-            lines = take_lines()  # now, before the keeper sees they're no longer wanted
-            wake.set()  # another session may still be waiting: open new ones for it
-            await stop_current()
-            current = asyncio.create_task(speak_until_mic(msg, lines))
+            # Lines from two sessions both get heard: the later one waits its turn. A
+            # newer line from the session that is talking replaces what it was saying.
+            if busy() and session != current_session:
+                wait_turn(msg)
+            else:
+                waiting[:] = [m for m in waiting if str(m.get("session") or "") != session]
+                await stop_current()
+                play(msg)
+        elif cmd == "stop" and session:
+            # The user sent a prompt in that session: its line is old news, so it stops and
+            # its waiting line goes. A line from another session plays on: it is news.
+            waiting[:] = [m for m in waiting if str(m.get("session") or "") != session]
+            if session == current_session:
+                await stop_current()
+                if waiting:
+                    play(waiting.pop(0))
         elif cmd in ("stop", "quit"):
+            waiting.clear()
             await stop_current()
             if cmd == "quit" and quitting:  # setup is about to rebuild the venv we run from
                 quitting.set()

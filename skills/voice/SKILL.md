@@ -1,11 +1,11 @@
 ---
 name: voice
-description: Control tldr-voice, which reads the TL;DR line of each answer aloud. on, off, status, stop, test, language en|de, engine edge|piper, name on|off.
-argument-hint: "on | off | status | stop | test | language en|de | engine edge|piper | name on|off"
+description: Control tldr-voice, which reads the TL;DR line of each answer aloud. on, off, status, stop, test, language en|de, engine edge|piper, name on|off, speed 0.5-2, again.
+argument-hint: "on | off | status | stop | test | language en|de | engine edge|piper | name on|off | speed 0.5-2 | again"
 disable-model-invocation: true
 allowed-tools: Bash(sh *)
 ---
 
 !`sh "${CLAUDE_SKILL_DIR}/../../scripts/run.sh" $ARGUMENTS`
 
-The output above is from the tldr-voice control command. Relay it to the user in one short plain line. Don't run anything else. If it printed a usage line, list the options: on, off, status, stop, test, language en|de, engine edge|piper, name on|off.
+The output above is from the tldr-voice control command. Relay it to the user in one short plain line. Don't run anything else. If it printed a usage line, list the options: on, off, status, stop, test, language en|de, engine edge|piper, name on|off, speed 0.5-2, again.

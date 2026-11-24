@@ -70,24 +70,28 @@ Windows is needed too), then tell me to restart Claude Code.
 
 ## Use
 
-Click the 🔊 icon above the prompt to mute or unmute, or use the command:
+Click the 🔊 icon above the prompt to mute or unmute, and ↻ beside it to hear the session's last TL;DR again, or use the command. (From your third day of use, the same row asks once for a GitHub star; ⭐ opens the repository, ✕ hides it for good.)
 
 | Command | What it does |
 | --- | --- |
 | `/tldr-voice:voice off` · `on` | Mute or unmute |
 | `/tldr-voice:voice language de` · `en` | Speak German or English |
 | `/tldr-voice:voice engine piper` | Offline voice only (`edge` = online, the default) |
-| `/tldr-voice:voice name on` · `off` | Say which project a reply comes from ("Message from tldr voice.") when it differs from the last one you heard |
+| `/tldr-voice:voice name on` · `off` | Say which project a reply comes from ("Message from tldr voice.") when you aren't looking at it |
+| `/tldr-voice:voice speed 1.2` | Speak faster or slower, from `0.5` to `2` (`1` is normal) |
 | `/tldr-voice:voice stop` | Stop talking now |
+| `/tldr-voice:voice again` | Say the last TL;DR again (the ↻ next to 🔊 does it for that session) |
 | `/tldr-voice:voice test` | Hear the voice |
 | `/tldr-voice:voice status` | Show the current settings |
 
 In the terminal the TL;DR line is drawn with a 📣 on its left and in Claude's orange, so it is easy to spot. The reply itself keeps the plain `TL;DR:` line.
 
-With `name on`, the project's name is its tmux window's name, or the project folder's name outside tmux. It is recorded once per name, so it plays at once, while the reply's line is still on its way.
+With `name on`, the project's name is its tmux window's name, or the project folder's name outside tmux. It is said when that window isn't the one on your screen, and left out when it is. Outside tmux, where that can't be told, it is said when the voice comes from another project than last time. It is recorded once per name, so it plays at once, while the reply's line is still on its way.
+
+With several sessions running, every reply gets heard: when one finishes while another is speaking, its line waits its turn. A newer line from the session that is speaking replaces what it was saying.
 
 > [!TIP]
-> Typing your next message stops the voice, and so does holding space to talk. The hold-space stop needs `pactl` (PulseAudio or PipeWire), so it works on Linux only.
+> Sending your next message stops that session's voice (another session's line plays on), and holding space to talk stops all of it. The hold-space stop needs `pactl` (PulseAudio or PipeWire), so it works on Linux only.
 
 ### Settings
 

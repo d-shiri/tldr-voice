@@ -11,9 +11,9 @@ export const drawTldrLine: Register = on => {
     if (e.props.isSummary) return next(e)
     const lines = e.props.text.split('\n')
     const first = lines.findIndex(l => l.trim() !== '')
-    const m = first < 0 ? null : TLDR.exec(lines[first].trim())
+    const m = first < 0 ? null : TLDR.exec((lines[first] ?? '').trim())
     if (!m) return next(e)
-    const said = m[1].replace(/\*\*|__|`/g, '').trim()
+    const said = (m[1] ?? '').replace(/\*\*|__|`/g, '').trim()
     const rest = lines.slice(first + 1).join('\n').replace(/^\s*\n/, '')
     const { Box, Text } = $.ui.resolve(e)
     return (

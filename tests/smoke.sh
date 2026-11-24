@@ -197,6 +197,40 @@ run name off >/dev/null
 [ ! -f "$STATE/announce" ] && ok "name off" || fail "name off didn't turn it off"
 run stop >/dev/null
 
+step "two sessions finish together: the second line waits its turn, then plays"
+rm -f "$STATE/edge.log"
+n=$RANDOM
+printf '{"index":0,"session_id":"a","delta":"TL;DR: The first session finished task %s and every check passed.\\nMore."}' "$n" | run display
+sleep 0.3
+printf '{"index":0,"session_id":"b","delta":"TL;DR: The second session finished task %s too.\\nMore."}' "$n" | run display
+grep -q "waits its turn" "$STATE/edge.log" 2>/dev/null && ok "the second line waits" || fail "the second line didn't wait"
+heard=0
+for _ in $(seq 1 60); do
+  heard=$(grep -cE "first audio after|Piper fallback" "$STATE/edge.log" 2>/dev/null)
+  [ "$heard" -ge 2 ] && break
+  sleep 0.5
+done
+[ "$heard" -ge 2 ] && ok "both lines were spoken" || fail "only $heard of 2 lines were spoken"
+run stop >/dev/null
+
+step "replay: a session's own last line, not another session's"
+n=$RANDOM
+printf '{"index":0,"session_id":"r1","delta":"TL;DR: Replay line one %s.\\nMore."}' "$n" | run display
+printf '{"index":0,"session_id":"r2","delta":"TL;DR: Replay line two %s.\\nMore."}' "$n" | run display
+run again r1 >/dev/null
+[ "$(cat "$STATE/last_spoken.txt")" = "Replay line one $n." ] && ok "session r1's line replayed" \
+  || fail "replayed: $(cat "$STATE/last_spoken.txt")"
+run again no-such-session >/dev/null; [ $? -eq 3 ] && ok "nothing to replay for an unknown session" \
+  || fail "an unknown session didn't say there was nothing to replay"
+run stop >/dev/null
+
+step "speed"
+run speed 1.3 >/dev/null && run status | grep -q "speed: 1.3" && ok "speed 1.3 set" || fail "speed 1.3 not set"
+run speed 5 >/dev/null; [ $? -eq 2 ] && ok "speed 5 refused" || fail "speed 5 was taken"
+rate=$(speak_value "speak.edge_rate()")
+[ "$rate" = "+30%" ] && ok "online rate $rate" || fail "online rate $rate"
+run speed 1 >/dev/null
+
 echo
 if [ "$failures" -eq 0 ]; then
   echo "All smoke checks passed."
