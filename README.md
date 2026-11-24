@@ -70,7 +70,7 @@ Windows is needed too), then tell me to restart Claude Code.
 
 ## Use
 
-Click the 🔊 icon above the prompt to mute or unmute, and ↻ beside it to hear the session's last TL;DR again, or use the command. (From your third day of use, the same row asks once for a GitHub star; ⭐ opens the repository, ✕ hides it for good.)
+Click the 🔊 icon above the prompt to mute or unmute, and 🗘 beside it to hear the session's last TL;DR again, or use the command. (From your third day of use, the same row asks once for a GitHub star; ⭐ opens the repository, ✕ hides it for good.)
 
 | Command | What it does |
 | --- | --- |
@@ -80,7 +80,7 @@ Click the 🔊 icon above the prompt to mute or unmute, and ↻ beside it to hea
 | `/tldr-voice:voice name on` · `off` | Say which project a reply comes from ("Message from tldr voice.") when you aren't looking at it |
 | `/tldr-voice:voice speed 1.2` | Speak faster or slower, from `0.5` to `2` (`1` is normal) |
 | `/tldr-voice:voice stop` | Stop talking now |
-| `/tldr-voice:voice again` | Say the last TL;DR again (the ↻ next to 🔊 does it for that session) |
+| `/tldr-voice:voice again` | Say the last TL;DR again (the 🗘 next to 🔊 does it for that session) |
 | `/tldr-voice:voice test` | Hear the voice |
 | `/tldr-voice:voice status` | Show the current settings |
 

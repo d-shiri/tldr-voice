@@ -200,7 +200,7 @@ export const register: Register = (on, options) => {
             onPress={toggle}
           />
           <Text> </Text>
-          <Button key="tldr-voice-replay" plain label="↻" onPress={replay} />
+          <Button key="tldr-voice-replay" plain label="🗘" onPress={replay} />
           <Text dimColor> TL;DR voice {current ? 'on' : 'muted'}</Text>
         </Box>
         {asking ? (

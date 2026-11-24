@@ -106,7 +106,7 @@ test('once asked, it never counts or asks again', async ($, on) => {
   await ui.unmount()
 })
 
-test("↻ replays this session's last line", async ($, on) => {
+test("🗘 replays this session's last line", async ($, on) => {
   const stored: Record<string, unknown> = { daysUsed: [] }
   const runs: string[][] = []
   engine(on, stored, runs)
