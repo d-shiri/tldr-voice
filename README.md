@@ -77,9 +77,14 @@ Click the 🔊 icon above the prompt to mute or unmute, or use the command:
 | `/tldr-voice:voice off` · `on` | Mute or unmute |
 | `/tldr-voice:voice language de` · `en` | Speak German or English |
 | `/tldr-voice:voice engine piper` | Offline voice only (`edge` = online, the default) |
+| `/tldr-voice:voice name on` · `off` | Say which project a reply comes from ("Message from tldr voice.") when it differs from the last one you heard |
 | `/tldr-voice:voice stop` | Stop talking now |
 | `/tldr-voice:voice test` | Hear the voice |
 | `/tldr-voice:voice status` | Show the current settings |
+
+In the terminal the TL;DR line is drawn with a 📣 on its left and in Claude's orange, so it is easy to spot. The reply itself keeps the plain `TL;DR:` line.
+
+With `name on`, the project's name is its tmux window's name, or the project folder's name outside tmux. It is recorded once per name, so it plays at once, while the reply's line is still on its way.
 
 > [!TIP]
 > Typing your next message stops the voice, and so does holding space to talk. The hold-space stop needs `pactl` (PulseAudio or PipeWire), so it works on Linux only.
@@ -107,7 +112,7 @@ Set these in the `env` block of `~/.claude/settings.json`:
 > The default voices start speaking in under a second. The English Multilingual voices (`en-US-AvaMultilingualNeural`, `en-US-EmmaMultilingualNeural`) sound a little richer but take 3 to 6 seconds on every new sentence; if you pick one, raise `TLDR_VOICE_EDGE_TIMEOUT` to `8`.
 
 > [!NOTE]
-> **Privacy:** the online voice sends only the TL;DR line to Microsoft's speech service. To start speaking sooner it opens its connection to that service when you send a prompt, before there is a line to send. `/tldr-voice:voice engine piper` keeps everything offline.
+> **Privacy:** the online voice sends only the TL;DR line (and, with `name on`, the project's name) to Microsoft's speech service. To start speaking sooner it opens its connection to that service when you send a prompt, before there is a line to send. `/tldr-voice:voice engine piper` keeps everything offline.
 
 ## Uninstall
 

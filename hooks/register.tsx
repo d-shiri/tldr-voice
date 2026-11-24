@@ -1,5 +1,6 @@
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register } from 'claude-code'
+import { drawTldrLine } from './tldr-line'
 
 // A speaker icon in the band above the prompt: click it to mute or unmute tldr-voice.
 // The on/off switch is the same flag file the voice script reads, so the icon,
@@ -43,7 +44,9 @@ async function refresh($: EngineInterface): Promise<void> {
   await update($, isOn, () => !off)
 }
 
-export const register: Register = on => {
+export const register: Register = (on, options) => {
+  drawTldrLine(on, options)
+
   on('session.start', async ($, e, next) => {
     await refresh($)
     return next(e)

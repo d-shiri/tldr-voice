@@ -3,7 +3,9 @@
 Listens on a Unix socket (on Windows: a local TCP port, with a key) for one-line JSON
 commands from speak.py:
   {"cmd": "speak", "text": "...", "voice": "...", "piper_model": "...", "mic_stop": true,
-   "timeout": 3, "session": "..."}  stream audio straight into mpv (latest wins)
+   "timeout": 3, "session": "...",
+   "intro": "...", "intro_clip": "..."}  stream audio straight into mpv (latest wins),
+                                    after the intro (optional; see load_intro)
   {"cmd": "stop"}                   silence current speech
   {"cmd": "warm", "session": "..."} a reply is coming: hold connections open for it
   {"cmd": "rest", "session": "..."} that reply ended without a line to speak
@@ -61,6 +63,7 @@ KEEP_ALIVE_EVERY = 15.0    # the service drops a connection that is silent for ~
 
 current: "asyncio.Task | None" = None
 procs: set = set()
+recording: set = set()   # intros being recorded for next time
 last_used = 0.0
 quitting: "asyncio.Event | None" = None  # made in main(): an Event belongs to its loop
 commands: "asyncio.Lock | None" = None   # made in main() too: one command at a time
@@ -176,11 +179,50 @@ async def mic_opened(enabled: bool) -> bool:
         await p.wait()
 
 
+def load_intro(msg: dict) -> bytes:
+    """The recording of the line's intro ("Message from <project>."), if there is one."""
+    clip = str(msg.get("intro_clip") or "")
+    if not msg.get("intro") or not clip:
+        return b""
+    try:
+        return Path(clip).read_bytes()
+    except OSError:
+        return b""
+
+
+async def record_intro(intro: str, voice: str, clip: Path) -> None:
+    """Record the intro once, so from then on it plays from disk without waiting for the
+    service. Its audio has the same format as a line's, so the two play as one stream."""
+    tmp = clip.with_suffix(f".{os.getpid()}.part")
+    try:
+        clip.parent.mkdir(parents=True, exist_ok=True)
+        await edge_tts.Communicate(intro, voice).save(str(tmp))
+        if tmp.stat().st_size > 0:
+            tmp.replace(clip)
+    except Exception as e:  # noqa: BLE001 - it is tried again with the next intro
+        log(f"couldn't record the intro ({type(e).__name__})")
+    finally:
+        tmp.unlink(missing_ok=True)
+
+
+def record_later(msg: dict) -> None:
+    task = asyncio.ensure_future(record_intro(
+        str(msg["intro"]), msg.get("voice") or DEFAULT_VOICE, Path(str(msg["intro_clip"]))))
+    recording.add(task)  # asyncio itself keeps only a weak reference to a running task
+    task.add_done_callback(recording.discard)
+
+
 async def speak_until_mic(msg: dict, lines: list) -> None:
     """Speak, but stop the moment the microphone opens: you want to talk, so the voice stops."""
-    speech = asyncio.create_task(speak(msg["text"], msg.get("voice") or DEFAULT_VOICE,
+    intro = load_intro(msg)
+    text = msg["text"]
+    if msg.get("intro") and not intro:
+        text = f"{msg['intro']} {text}"  # no recording yet: the service says it with the line
+        if msg.get("intro_clip"):
+            record_later(msg)
+    speech = asyncio.create_task(speak(text, msg.get("voice") or DEFAULT_VOICE,
                                        Path(msg.get("piper_model") or ""),
-                                       first_audio_timeout(msg), lines))
+                                       first_audio_timeout(msg), lines, intro))
     watch = asyncio.create_task(mic_opened(bool(msg.get("mic_stop", True))))
     try:
         await asyncio.wait({speech, watch}, return_when=asyncio.FIRST_COMPLETED)
@@ -447,8 +489,10 @@ async def race_streams(text: str, voice: str, timeout: float, lines: list, t0: f
             t.cancel()
 
 
-async def speak(text: str, voice: str, piper_model: Path, timeout: float, lines: list) -> None:
-    """Say one sentence. `lines` are the connections that were held open for it."""
+async def speak(text: str, voice: str, piper_model: Path, timeout: float, lines: list,
+                intro: bytes = b"") -> None:
+    """Say one sentence. `lines` are the connections that were held open for it. `intro` is
+    recorded audio that plays first, while the service is still working on the sentence."""
     t0 = asyncio.get_running_loop().time()
     player = None
     got_audio = False
@@ -458,6 +502,9 @@ async def speak(text: str, voice: str, piper_model: Path, timeout: float, lines:
             *cfg.stream_player_argv(), stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL, **cfg.detached())
         assert player.stdin is not None
+        if intro:
+            player.stdin.write(intro)
+            await player.stdin.drain()
         async for data in race_streams(text, voice, timeout, lines, t0):
             got_audio = True
             player.stdin.write(data)

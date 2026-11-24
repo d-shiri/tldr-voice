@@ -8,7 +8,8 @@ Hook modes (first argument, hook JSON on stdin), wired up in hooks/hooks.json:
   reply-end Stop:            backup: speak the TL;DR if it wasn't spoken while streaming
 
 Control modes (/tldr-voice:voice <mode>):
-  on | off | status | stop | engine edge|piper | language en|de | test [TEXT] | setup
+  on | off | status | stop | engine edge|piper | language en|de | name on|off
+  | test [TEXT] | setup
 
 Uses only the Python standard library, so hooks start fast. The voices (edge-tts, Piper)
 live in their own environment in the plugin's data folder, built on first use.
@@ -98,12 +99,12 @@ RETRY_SETUP_AFTER = 600                  # seconds
 DAEMON = CODE / "edge_daemon.py"
 # Unix socket paths are capped at ~104 chars, so prefer the short runtime dir.
 # The number changes when the helper's protocol does, so an old helper is never reused.
-SOCK = (Path(os.environ["XDG_RUNTIME_DIR"]) / "tldr-voice-3.sock"
-        if os.environ.get("XDG_RUNTIME_DIR") else STATE / "edge-3.sock")
+SOCK = (Path(os.environ["XDG_RUNTIME_DIR"]) / "tldr-voice-4.sock"
+        if os.environ.get("XDG_RUNTIME_DIR") else STATE / "edge-4.sock")
 # With TCP the helper writes "<port> <key>" here; a command without the key is ignored,
 # so only someone who can read this user's state folder can make it speak.
-PORT_FILE = STATE / "edge-3.port"
-OWNER_FILE = STATE / "edge-3.owner"     # Unix socket: which helper the socket belongs to
+PORT_FILE = STATE / "edge-4.port"
+OWNER_FILE = STATE / "edge-4.owner"     # Unix socket: which helper the socket belongs to
 STARTING = STATE / "helper.starting"    # a hook is starting the helper right now
 OFF_FLAG = STATE / "disabled"
 ENGINE_FILE = STATE / "engine"          # "edge" (default) or "piper"
@@ -111,6 +112,9 @@ LANGUAGE_FILE = STATE / "language"      # "en" or "de"; overrides the install-ti
 PID_FILE = STATE / "speaking.pid"       # process group of local (Piper) playback
 LAST_FILE = STATE / "last_spoken.txt"   # the line spoken last
 SPOKEN_DIR = STATE / "spoken"           # one file per line spoken since the last prompt
+ANNOUNCE_FLAG = STATE / "announce"      # there: say which project a line comes from
+LAST_PROJECT = STATE / "last_project"   # the project whose line was spoken last, any session
+INTROS_DIR = DATA / "intros"            # "Message from <project>." recorded once per name
 
 # Linux can play the offline voice without mpv (paplay or aplay); macOS and Windows can't.
 if MACOS:
@@ -167,9 +171,10 @@ LANGUAGES = {
 EDGE_TIMEOUT = 3.0  # seconds without audio from the online voice before Piper speaks instead
 
 RULES = ("Start your final reply (the message after any tool work) with one line "
-         "'TL;DR: <one or two short, plain sentences>' as its very first line. It is read aloud, "
+         "'TL;DR: <up to three short, plain sentences>' as its very first line. It is read aloud, "
          "so no markdown, code, file paths, URLs or symbols: say what happened or what you need "
-         "from the user, and if the reply asks a question, ask it there too. "
+         "from the user, with the most important results, and if the reply asks a question, "
+         "ask it there too. Keep it all on that one line. "
          # The service starts speaking once it has the first sentence: ~0.6 s for a short
          # one, ~1.1 s for twenty words.
          "Keep its first sentence short, about ten words at most, and put details in the "
@@ -177,7 +182,7 @@ RULES = ("Start your final reply (the message after any tool work) with one line
          "No TL;DR line in short progress notes between tool calls.")
 REMINDER = {
     "en": "tldr-voice is on. " + RULES,
-    "de": "tldr-voice is on. " + RULES + " Write the sentence after 'TL;DR:' in German, "
+    "de": "tldr-voice is on. " + RULES + " Write the sentences after 'TL;DR:' in German, "
           "even when the rest of the reply is in another language; keep the 'TL;DR:' prefix.",
 }
 TLDR_RE = re.compile(r"^\W*TL;?DR\W*:?\W*\s*(.+)$", re.IGNORECASE)
@@ -371,7 +376,7 @@ def clean(text: str) -> str:
     text = re.sub(r"\[([^\]]*)\]\([^)]*\)", r"\1", text)   # links -> label
     text = re.sub(r"https?://\S+", "", text)
     text = re.sub(r"[*_#>|~]", "", text)                   # markdown symbols
-    return re.sub(r"\s+", " ", text).strip()[:400]
+    return re.sub(r"\s+", " ", text).strip()[:600]
 
 
 def extract_tldr(message: str) -> str:
@@ -575,17 +580,73 @@ def piper_command(model: Path) -> str:
     return f'printf "%s" "$1" | "{PIPER}" -m "{model}" --output-raw 2>/dev/null | {player}'
 
 
+# ---------- which project a line comes from ----------
+
+INTRO = {"en": "Message from {}.", "de": "Nachricht von {}."}
+# Names a tmux window takes from the program running in it, which say nothing about the project.
+PROGRAM_NAMES = {"claude", "node", "sh", "bash", "zsh", "fish", "python", "python3", "tmux"}
+
+
+def project_name(cwd: str = "") -> str:
+    """The project as the user sees it: the name of this pane's tmux window, else the project
+    folder's name. Asked of tmux for this pane: a plain `tmux display` answers for the window
+    on screen, which is often another one."""
+    name = ""
+    pane = os.environ.get("TMUX_PANE")
+    if os.environ.get("TMUX") and pane and shutil.which("tmux"):
+        try:
+            r = subprocess.run(["tmux", "display", "-p", "-t", pane,
+                                "#{window_name}\t#{pane_current_command}"],
+                               capture_output=True, text=True, timeout=1)
+            name, _, program = r.stdout.strip().partition("\t")
+            if name in PROGRAM_NAMES or name == program or re.fullmatch(r"[\d.]+", name):
+                name = ""  # tmux named it after the program (Claude Code shows its version)
+        except (OSError, subprocess.SubprocessError):
+            name = ""
+    if not name:
+        name = Path(os.environ.get("CLAUDE_PROJECT_DIR") or cwd or os.getcwd()).name
+    return re.sub(r"[\W_]+", " ", name).strip()[:40]  # "tldr-voice" is read "tldr voice"
+
+
+def intro_for(cwd: str) -> str:
+    """"Message from <project>." when the announcement is on and the line before this one
+    came from another project (in any session), else nothing."""
+    if not ANNOUNCE_FLAG.exists():
+        return ""
+    name = project_name(cwd)
+    if not name or name == read(LAST_PROJECT):
+        return ""
+    try:
+        LAST_PROJECT.write_text(name, encoding="utf-8")
+    except OSError:
+        pass
+    return INTRO[language()].format(name)
+
+
+def intro_clip(intro: str, voice: str) -> Path:
+    """Where the helper keeps the online voice's recording of this intro."""
+    key = hashlib.sha256(f"{voice}\n{intro}".encode("utf-8")).hexdigest()[:24]
+    return INTROS_DIR / f"{key}.mp3"
+
+
 def mic_stop_enabled() -> bool:
     return os.environ.get("TLDR_VOICE_MIC_STOP", "1") != "0" and bool(shutil.which("pactl"))
 
 
-def speak(text: str, session: str = "") -> None:
+def speak(text: str, session: str = "", cwd: "str | None" = None) -> None:
+    """Read a line aloud. `cwd` is given for a reply's line: then it may start by saying
+    which project it comes from (see intro_for)."""
     if not text or not ensure_setup():
         return
     LAST_FILE.write_text(text, encoding="utf-8")
     stop_local()
+    intro = intro_for(cwd) if cwd is not None else ""
     msg = {"cmd": "speak", "text": text, "voice": edge_voice(), "piper_model": str(piper_model()),
            "mic_stop": mic_stop_enabled(), "timeout": edge_timeout(), "session": session}
+    if intro:
+        # The helper plays the recording and asks for the line meanwhile; with no
+        # recording yet it says the intro as part of the line and records it for next time.
+        msg.update(intro=intro, intro_clip=str(intro_clip(intro, msg["voice"])))
     # Edge voice: the helper stops what it was saying, streams the audio as it arrives and
     # falls back to Piper itself.
     if engine() == "edge" and shutil.which("mpv") and daemon_send(msg, start=True):
@@ -593,6 +654,8 @@ def speak(text: str, session: str = "") -> None:
     daemon_send({"cmd": "stop"}, start=False)
     if not offline_ready():
         return
+    if intro:
+        text = f"{intro} {text}"
     if WINDOWS:
         # No shell pipeline here: a detached copy of this script joins Piper to mpv.
         proc = subprocess.Popen([sys.executable, str(Path(__file__).resolve()), "play-piper", text],
@@ -632,7 +695,8 @@ def status() -> str:
     else:
         setup = f"not ready, see {SETUP_LOG}"
     lines = [f"tldr-voice: {'off' if OFF_FLAG.exists() else 'on'} | language: {language()} | "
-             f"engine: {engine()} | voices: {setup}"]
+             f"engine: {engine()} | project name: {'on' if ANNOUNCE_FLAG.exists() else 'off'} | "
+             f"voices: {setup}"]
     if not shutil.which("mpv"):
         lines.append(f"{mpv_missing()} {MPV_INSTALL}")
     if MACOS or WINDOWS:
@@ -660,6 +724,16 @@ def control(mode: str, args: list) -> int:
             ensure_setup()  # fetch that language's offline voice if it's missing
             print("tldr-voice language:", args[0].lower()); return 0
         print("usage: language en|de"); return 2
+    if mode == "name":
+        if args[:1] == ["on"]:
+            ANNOUNCE_FLAG.touch()
+            LAST_PROJECT.unlink(missing_ok=True)  # so the next line says its project
+            print("tldr-voice: says the project name when the voice comes from another project")
+            return 0
+        if args[:1] == ["off"]:
+            ANNOUNCE_FLAG.unlink(missing_ok=True); print("tldr-voice: project name off"); return 0
+        print("usage: name on|off (say which project a line comes from, when it changes)")
+        return 2
     if mode in ("stop", "stop-audio"):
         stop_audio(); print("tldr-voice: stopped"); return 0
     if mode in ("test", "say"):
@@ -717,7 +791,7 @@ def main() -> int:
     text = data.get("delta" if mode == "display" else "last_assistant_message") or ""
     tldr = extract_tldr(str(text))
     if tldr and claim(tldr):
-        speak(tldr, session)
+        speak(tldr, session, str(data.get("cwd") or ""))
     elif mode == "reply-end" and not tldr:
         daemon_send({"cmd": "rest", "session": session}, start=False)  # nothing to say
     return 0

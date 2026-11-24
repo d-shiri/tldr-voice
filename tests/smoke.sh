@@ -182,6 +182,21 @@ step "mute and unmute"
 run off && [ -f "$STATE/disabled" ] && ok "muted" || fail "off didn't mute"
 run on && [ ! -f "$STATE/disabled" ] && ok "unmuted" || fail "on didn't unmute"
 
+step "the project's name: said when the voice comes from another project, recorded once"
+INTROS=$(speak_value "speak.INTROS_DIR.as_posix()")
+rm -rf "$INTROS"
+run name on >/dev/null
+n=$RANDOM
+printf '{"index":0,"cwd":"/tmp/smoke-%s","delta":"TL;DR: A line from project %s.\\nMore."}' "$n" "$n" | TMUX= run display
+[ "$(cat "$STATE/last_project" 2>/dev/null)" = "smoke $n" ] \
+  && ok "the project is remembered as spoken" || fail "last project: $(cat "$STATE/last_project" 2>/dev/null)"
+recorded=false
+for _ in $(seq 1 30); do ls "$INTROS"/*.mp3 >/dev/null 2>&1 && { recorded=true; break; }; sleep 0.5; done
+$recorded && ok "the intro was recorded for next time" || fail "no intro recording in $INTROS"
+run name off >/dev/null
+[ ! -f "$STATE/announce" ] && ok "name off" || fail "name off didn't turn it off"
+run stop >/dev/null
+
 echo
 if [ "$failures" -eq 0 ]; then
   echo "All smoke checks passed."
